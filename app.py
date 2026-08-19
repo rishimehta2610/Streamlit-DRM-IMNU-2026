@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v2.2"
+APP_VERSION = "v2.4"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -2133,7 +2133,7 @@ def summarize_hold_vs_exit(hold_table):
             f"not as a signal to always hold longer.")
 
 def generate_pdf_report():
-    pdf = FPDF()
+    pdf = FPDF(orientation="L")
     pdf.add_page()
     pdf.set_font("Arial", "B", 16)
     pdf.cell(0, 10, "Option Market Simulator - Performance Report", ln=True, align="C")
@@ -2168,19 +2168,26 @@ def generate_pdf_report():
     pdf.ln(4)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 8, "Tradebook", ln=True)
-    pdf.set_font("Arial", "B", 9)
-    for col, w in [("Time", 25), ("Instrument", 30), ("Side", 18), ("Qty", 18), ("Entry", 25), ("Exit", 25), ("P&L", 25)]:
-        pdf.cell(w, 7, col, 1)
+    pdf.set_font("Arial", "B", 8)
+    pdf.cell(39, 7, "Entry Date & Time", 1)
+    pdf.cell(39, 7, "Exit Date & Time", 1)
+    pdf.cell(30, 7, "Instrument", 1)
+    pdf.cell(16, 7, "Side", 1)
+    pdf.cell(18, 7, "Qty", 1)
+    pdf.cell(25, 7, "Entry", 1)
+    pdf.cell(25, 7, "Exit", 1)
+    pdf.cell(28, 7, "P&L", 1)
     pdf.ln()
-    pdf.set_font("Arial", "", 8)
+    pdf.set_font("Arial", "", 7)
     for t in st.session_state.tradebook:
-        pdf.cell(25, 6, t['entry_time'], 1)
+        pdf.cell(39, 6, _trade_datetime_text(t, "entry"), 1)
+        pdf.cell(39, 6, _trade_datetime_text(t, "exit") if t['status'] == 'Closed' else "-", 1)
         pdf.cell(30, 6, "Underlying" if t['type'] == 'FUT' else f"{t['strike']} {t['type']}", 1)
-        pdf.cell(18, 6, t['side'], 1)
+        pdf.cell(16, 6, t['side'], 1)
         pdf.cell(18, 6, str(t['qty']), 1)
         pdf.cell(25, 6, f"{t['entry_price']:.2f}", 1)
         pdf.cell(25, 6, f"{t['exit_price']:.2f}" if t['status'] == 'Closed' else "-", 1)
-        pdf.cell(25, 6, f"{t['pnl']:+.2f}" if t['status'] == 'Closed' else "Open", 1)
+        pdf.cell(28, 6, f"{t['pnl']:+.2f}" if t['status'] == 'Closed' else "Open", 1)
         pdf.ln()
 
     # Hold-to-Day-22 hypothetical table
@@ -2235,6 +2242,7 @@ def _settle_all_cash(spot, current_dt):
             intrinsic = max(strike - float(spot), 0.0)
 
         t["exit_time"] = current_dt.strftime("%H:%M:%S")
+        t["exit_dt"] = _iso(current_dt)
         t["exit_price"] = float(intrinsic)
         sign = 1 if t.get("side") == "Buy" else -1
         qty = int(t.get("qty", 0) or 0)
@@ -2287,6 +2295,7 @@ def _close_all_open_trades_at_market(current_price, current_dt, chain_df, reason
 
         exit_price = _mark_open_trade(t, current_price, chain_df)
         t["exit_time"] = current_dt.strftime("%H:%M:%S")
+        t["exit_dt"] = _iso(current_dt)
         t["exit_price"] = float(exit_price)
 
         sign = 1 if t.get("side") == "Buy" else -1
@@ -2353,6 +2362,67 @@ def _close_one_trade_at_market(t, current_price, current_dt, chain_df, reason="m
     st.session_state.realized_pnl += float(pnl)
     _rebuild_positions_from_open_trades()
     return float(pnl)
+
+
+def _trade_datetime_text(t, which):
+    """Human-readable simulated market date/time for a trade; backward-compatible with old sessions."""
+    iso_key = "entry_dt" if which == "entry" else "exit_dt"
+    legacy_key = "entry_time" if which == "entry" else "exit_time"
+    raw = t.get(iso_key)
+    if raw:
+        try:
+            dt = pd.to_datetime(raw)
+            return dt.strftime("%d-%m-%Y %H:%M:%S")
+        except Exception:
+            return str(raw)
+    legacy = t.get(legacy_key)
+    if legacy and legacy != "-":
+        return str(legacy)
+    return "-"
+
+
+def _exit_all_callback(current_price, current_dt, chain_df):
+    """
+    Close all currently open trades atomically at the displayed simulated market mark.
+    The market's play/pause state is preserved: exiting positions must NOT pause a live market.
+    """
+    was_playing = bool(st.session_state.get("playing", False))
+    _close_all_open_trades_at_market(
+        current_price, current_dt, chain_df, "manual_exit_all"
+    )
+    st.session_state.playing = was_playing
+    # Reset the refresh anchor after the callback so a high-speed clock does not
+    # immediately leap before the post-exit screen is rendered.
+    if was_playing:
+        st.session_state.last_update = time.time()
+    save_session_state()
+    st.session_state["_last_trade_action"] = "All open trades exited"
+
+
+def _exit_one_callback(trade_key, current_price, current_dt, chain_df):
+    """Atomically close one open trade while preserving the market's live/paused state."""
+    was_playing = bool(st.session_state.get("playing", False))
+
+    target = None
+    for t in st.session_state.get("tradebook", []):
+        key = (
+            t.get("supabase_trade_id")
+            or f"{t.get('entry_time','')}_{t.get('strike','')}_{t.get('type','')}_{t.get('side','')}_{int(t.get('qty',0) or 0)}"
+        )
+        key = str(key).replace(" ", "_").replace(":", "_")
+        if key == trade_key and t.get("status") == "Open":
+            target = t
+            break
+
+    if target is not None:
+        _close_one_trade_at_market(
+            target, current_price, current_dt, chain_df, "manual"
+        )
+        st.session_state.playing = was_playing
+        if was_playing:
+            st.session_state.last_update = time.time()
+        save_session_state()
+        st.session_state["_last_trade_action"] = "Trade exited"
 
 def match_pending_limits(current_price, current_dt, chain_df, lot_size):
     """
@@ -2465,7 +2535,7 @@ def main():
     st.markdown("""
     <div class="fixed-header">
         <h1>NIFTY Options Trading Simulator</h1>
-        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.2.0</p>
+        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.4.0</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2912,8 +2982,11 @@ def main():
         speed = st.slider("Speed", 0.25, 5.0, float(st.session_state.speed), 0.25, key="speed_slider")
         st.session_state.speed = speed
         secs_per_bar = TICK_SECONDS_BASE / speed
-        st.caption(f"{speed:.2f}x  •  1 bar (5 sim-min) every {secs_per_bar:.1f}s  •  "
-                   f"~{(BARS_PER_DAY * secs_per_bar) / 60:.1f} min real-time per trading day")
+        st.caption(
+            f"{speed:.2f}x  •  simulated bar interval {secs_per_bar:.1f}s  •  "
+            f"~{(BARS_PER_DAY * secs_per_bar) / 60:.1f} min real-time per trading day  •  "
+            "screen refresh is intentionally throttled for responsive order controls"
+        )
 
         # Jump forward — single dropdown; selection jumps immediately
         jump_options = {
@@ -3602,8 +3675,8 @@ def main():
                                     &nbsp;{instrument_label(t.get('strike'), t.get('type'))}
                                 </div>
                                 <div class="pos-meta">
-                                    Qty {qty:,} · Entry ₹{entry:.2f} · LTP ₹{float(mark):.2f}
-                                    · {t.get('strategy_name') or 'Manual trade'}
+                                    Qty {qty:,} · Entry ₹{entry:.2f} · LTP ₹{float(mark):.2f}<br>
+                                    Entered: {_trade_datetime_text(t, "entry")} · {t.get('strategy_name') or 'Manual trade'}
                                 </div>
                             </div>
                             """,
@@ -3616,33 +3689,26 @@ def main():
                             unsafe_allow_html=True,
                         )
                     with cols[2]:
-                        if st.button(
+                        st.button(
                             "Exit",
                             key=f"exit_trade_{trade_key}",
                             disabled=st.session_state.trading_locked,
                             use_container_width=True,
-                        ):
-                            st.session_state.playing = False
-                            _close_one_trade_at_market(
-                                t, current_price, current_dt, chain_df, "manual"
-                            )
-                            save_session_state()
-                            st.toast("Trade exited", icon="✅")
-                            st.rerun()
+                            on_click=_exit_one_callback,
+                            args=(trade_key, current_price, current_dt, chain_df),
+                        )
 
-                if st.button(
+                st.button(
                     "Exit All",
                     use_container_width=True,
                     key="btn_exit_all",
                     disabled=st.session_state.trading_locked,
-                ):
-                    st.session_state.playing = False
-                    _close_all_open_trades_at_market(
-                        current_price, current_dt, chain_df, "manual_exit_all"
-                    )
-                    save_session_state()
-                    st.toast("All open trades exited", icon="✅")
-                    st.rerun()
+                    on_click=_exit_all_callback,
+                    args=(current_price, current_dt, chain_df),
+                )
+
+                if st.session_state.pop("_last_trade_action", None):
+                    st.success("Position exit completed. The market continues in its current play/pause state.")
 
                 # Portfolio-level summary remains netted for risk interpretation.
                 st.markdown(f"""
@@ -3749,6 +3815,8 @@ def main():
                         "Instrument": instrument_label(t.get('strike', 0), t.get('type')),
                         "Side": t.get('side'),
                         "Qty": t.get('qty'),
+                        "Entry Date & Time": _trade_datetime_text(t, "entry"),
+                        "Exit Date & Time": _trade_datetime_text(t, "exit") if t.get('status') == 'Closed' else "-",
                         "Entry": t.get('entry_price'),
                         "Exit": t.get('exit_price') if t.get('status') == 'Closed' else None,
                         "P&L (₹)": t.get('pnl', 0.0),
@@ -3995,17 +4063,13 @@ def main():
             else:
                 _draw_leaderboard()
 
-        # ===== LOW-FLICKER MARKET CLOCK =====
-        # Streamlit reconstructs the page on a full rerun. Redrawing every 5 seconds
-        # still produces visible flicker on a large dashboard. We therefore batch
-        # market-bar advancement and perform fewer full redraws.
-        #
-        # At 1x: 1 bar = 5 real seconds, UI redraw approximately every 15 seconds
-        # and advances ~3 bars in one pass. Faster speeds redraw more often, but never
-        # faster than every 5 seconds. The simulated elapsed time remains consistent.
+        # ===== LOW-FLICKER MARKET CLOCK v2.3 =====
+        # The simulated market speed controls how many bars become due, NOT how often
+        # the entire Streamlit page is rebuilt. Full-page rebuilds are kept at roughly
+        # an 8-second cadence so BUY/SELL/EXIT controls remain clickable even at 5x.
     if st.session_state.playing and st.session_state.current_index < n_bars - 1:
         seconds_per_bar = TICK_SECONDS_BASE / max(float(st.session_state.speed), 0.1)
-        ui_refresh_seconds = max(5.0, min(15.0, seconds_per_bar * 3.0))
+        ui_refresh_seconds = 8.0
         poll_seconds = 1.0
 
         @st.fragment(run_every=poll_seconds)
@@ -4025,7 +4089,6 @@ def main():
                 int(st.session_state.current_index) + bars_due,
                 n_bars - 1,
             )
-
             if new_index == int(st.session_state.current_index):
                 return
 
@@ -4035,16 +4098,11 @@ def main():
                 new_index,
             )
 
-            # Preserve unconsumed elapsed time so the simulated clock does not drift.
             consumed = bars_due * seconds_per_bar
-            st.session_state.last_update = last + consumed
-            if st.session_state.last_update > now:
-                st.session_state.last_update = now
-
-            # Save once per visible batch rather than on every hidden bar.
+            st.session_state.last_update = min(last + consumed, now)
             save_session_state()
 
-            # One full page redraw per batch, not one per individual 5-minute bar.
+            # Only one full dashboard refresh about every 8 seconds.
             st.rerun()
 
         _market_clock_fragment()
