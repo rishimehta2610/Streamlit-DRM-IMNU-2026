@@ -31,6 +31,7 @@ st.set_page_config(
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
 APP_VERSION = "v2.0"
+APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
 
@@ -2183,6 +2184,58 @@ def _settle_all_cash(spot, current_dt):
     st.session_state.positions = []
 
 
+
+def _mark_open_trade(t, current_price, chain_df):
+    """Return the current market mark for one open trade."""
+    typ = t.get("type")
+    if typ == "FUT":
+        return float(current_price)
+
+    strike = t.get("strike")
+    if chain_df is not None and len(chain_df) > 0 and strike is not None:
+        row = chain_df[chain_df["Strike"] == strike]
+        if len(row) > 0:
+            col = "CE Price" if typ == "CE" else "PE Price"
+            return float(row.iloc[0][col])
+
+    # Defensive fallback: if a mark cannot be found, do not fabricate a gain/loss.
+    return float(t.get("entry_price", 0.0))
+
+
+def _close_all_open_trades_at_market(current_price, current_dt, chain_df, reason):
+    """
+    Close every open trade at the current simulated market mark.
+
+    This deliberately works from the tradebook rather than consolidated positions.
+    That prevents offsetting long/short trades from being skipped when net quantity is zero.
+    """
+    realized_add = 0.0
+
+    for t in st.session_state.get("tradebook", []):
+        if t.get("status") != "Open":
+            continue
+
+        exit_price = _mark_open_trade(t, current_price, chain_df)
+        t["exit_time"] = current_dt.strftime("%H:%M:%S")
+        t["exit_price"] = float(exit_price)
+
+        sign = 1 if t.get("side") == "Buy" else -1
+        qty = int(t.get("qty", 0) or 0)
+        entry_price = float(t.get("entry_price", 0.0) or 0.0)
+        t["pnl"] = sign * (t["exit_price"] - entry_price) * qty
+        t["status"] = "Closed"
+
+        try:
+            close_trade_record(t, current_dt, t["exit_price"], reason)
+        except Exception as exc:
+            print(f"[Supabase] Failed to close trade record ({reason}): {exc}")
+
+        realized_add += float(t["pnl"])
+
+    st.session_state.realized_pnl += realized_add
+    st.session_state.positions = []
+    return realized_add
+
 def match_pending_limits(current_price, current_dt, chain_df, lot_size):
     """
     Re-evaluate pending LIMIT orders against the live option chain LTP.
@@ -2238,8 +2291,8 @@ def match_pending_limits(current_price, current_dt, chain_df, lot_size):
                         current_price=current_price, fill_price=item['price']
                     )
                 trade_id = save_trade_record(item, current_dt, order_id, current_price=current_price)
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[Supabase] Failed to persist filled limit trade: {exc}")
 
         st.session_state.tradebook.append({
             'entry_time': current_dt.strftime('%H:%M:%S'),
@@ -2275,9 +2328,14 @@ def match_pending_limits(current_price, current_dt, chain_df, lot_size):
 
 # ============ MAIN APP ============
 def main():
+    # Keep a local copy synchronized with the persisted/session lot size.
+    # Required by pricing, margin calculations, strategy legs and pending-limit matching.
+    lot_size = int(st.session_state.get("lot_size", 65))
+
     # Try restore persisted session on first load
     if not st.session_state.data_loaded:
         load_session_state()
+        lot_size = int(st.session_state.get("lot_size", 65))
     # Defensive check: if a corrupted/partial save left data_loaded=True but no
     # actual price path, fall back to the setup screen instead of crashing later.
     if st.session_state.data_loaded and (
@@ -2289,7 +2347,7 @@ def main():
     st.markdown("""
     <div class="fixed-header">
         <h1>NIFTY Options Trading Simulator</h1>
-        <p>DRM IMBA 2026 · Academic simulation environment</p>
+        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.0.4</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2614,7 +2672,7 @@ def main():
     chain_df = st.session_state.chain_df
 
     # Continuous limit-order matching against live LTPs
-    n_filled = match_pending_limits(current_price, current_dt, chain_df, lot_size)
+    n_filled = match_pending_limits(current_price, current_dt, chain_df, int(st.session_state.get("lot_size", 65)))
     if n_filled:
         st.toast(f"✅ {n_filled} limit order(s) filled", icon="📋")
 
@@ -2625,7 +2683,7 @@ def main():
         cons_pos = consolidate_positions(st.session_state.positions, current_price, T_current, chain_df)
         open_pnl = sum(p['pnl'] for p in cons_pos)
     realized_pnl = st.session_state.realized_pnl
-    used_margin = calculate_realistic_margin(st.session_state.positions, current_price, lot_size)
+    used_margin = calculate_realistic_margin(st.session_state.positions, current_price, int(st.session_state.get("lot_size", 65)))
     if used_margin > st.session_state.peak_margin_used:
         st.session_state.peak_margin_used = used_margin
     available_margin = max(0.0, st.session_state.starting_capital - used_margin)
@@ -2770,7 +2828,15 @@ def main():
         # Reset high-contrast
         st.markdown('<div class="reset-btn-container">', unsafe_allow_html=True)
         if st.button("RESET SESSION", use_container_width=True, key="btn_reset"):
-            # Close the current database session as a reset/abandoned run before starting a fresh one.
+            # A reset ends the current run. Close any still-open trades at the current
+            # simulated market price so analytics are not left with orphaned Open trades.
+            if st.session_state.get("tradebook"):
+                _close_all_open_trades_at_market(
+                    current_price, current_dt, chain_df, "session_reset"
+                )
+
+            cancel_pending_order_records(st.session_state.get("pending_limits", []), "session_reset")
+
             if supabase_enabled() and st.session_state.get("supabase_session_id"):
                 try:
                     finish_session_record(
@@ -2778,10 +2844,8 @@ def main():
                         current_day_num=current_day_num,
                         status="reset"
                     )
-                except Exception:
-                    pass
-
-            cancel_pending_order_records(st.session_state.get("pending_limits", []), "session_reset")
+                except Exception as exc:
+                    print(f"[Supabase] Failed to finalize reset session: {exc}")
 
             for key in list(st.session_state.keys()):
                 if key not in ['data_loaded', 'df_raw', 'simulated_data', 'df_day_scaled',
@@ -3003,8 +3067,8 @@ def main():
                                 current_price=current_price, fill_price=item['price']
                             )
                             trade_id = save_trade_record(item, current_dt, order_id, current_price=current_price)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            print(f"[Supabase] Failed to persist executed trade: {exc}")
 
                     st.session_state.positions.append({
                         'strike': item['strike'],
@@ -3435,22 +3499,9 @@ def main():
                 if st.button("Exit All", use_container_width=True, key="btn_exit_all",
                              disabled=st.session_state.trading_locked):
                     st.session_state.playing = False  # pause so exit is immediate
-                    realized_add = 0.0
-                    for pos in cons_pos:
-                        for t in st.session_state.tradebook:
-                            if (t['strike'] == pos['strike'] and t['type'] == pos['type'] and t['status'] == 'Open'):
-                                t['exit_time'] = current_dt.strftime('%H:%M:%S')
-                                t['exit_price'] = pos['current_price']
-                                sign = 1 if t['side'] == 'Buy' else -1
-                                t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
-                                t['status'] = 'Closed'
-                                try:
-                                    close_trade_record(t, current_dt, t['exit_price'], "manual_exit_all")
-                                except Exception:
-                                    pass
-                                realized_add += t['pnl']
-                    st.session_state.positions = []
-                    st.session_state.realized_pnl += realized_add
+                    _close_all_open_trades_at_market(
+                        current_price, current_dt, chain_df, "manual_exit_all"
+                    )
                     save_session_state()
                     st.toast("All positions exited", icon="✅")
                     st.rerun()
@@ -3708,22 +3759,12 @@ def main():
                 if st.button("Finish Session & Generate PDF Report", use_container_width=True, type="primary", key="btn_finish"):
                     cancel_pending_order_records(st.session_state.get("pending_limits", []), "finish_session")
                     st.session_state.pending_limits = []
-                    # Close remaining
-                    if st.session_state.positions:
-                        for pos in cons_pos:
-                            for t in st.session_state.tradebook:
-                                if t['strike'] == pos['strike'] and t['type'] == pos['type'] and t['status'] == 'Open':
-                                    t['exit_time'] = current_dt.strftime('%H:%M:%S')
-                                    t['exit_price'] = pos['current_price']
-                                    sign = 1 if t['side'] == 'Buy' else -1
-                                    t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
-                                    t['status'] = 'Closed'
-                                    try:
-                                        close_trade_record(t, current_dt, t['exit_price'], "finish_session")
-                                    except Exception:
-                                        pass
-                                    st.session_state.realized_pnl += t['pnl']
-                        st.session_state.positions = []
+                    # Close every remaining open trade at the current simulated market mark.
+                    # Using the tradebook avoids missing offsetting trades whose net position is zero.
+                    if any(t.get("status") == "Open" for t in st.session_state.get("tradebook", [])):
+                        _close_all_open_trades_at_market(
+                            current_price, current_dt, chain_df, "finish_session"
+                        )
                     with st.spinner("Generating PDF..."):
                         path, fname = generate_pdf_report()
                         st.session_state.report_path = path
