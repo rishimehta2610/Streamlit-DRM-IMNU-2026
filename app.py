@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v2.5.1"
+APP_VERSION = "v2.6"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -2375,6 +2375,7 @@ def _close_one_trade_at_market(t, current_price, current_dt, chain_df, reason="m
 
     exit_price = _mark_open_trade(t, current_price, chain_df)
     t["exit_time"] = current_dt.strftime("%H:%M:%S")
+    t["exit_dt"] = _iso(current_dt)
     t["exit_price"] = float(exit_price)
 
     sign = 1 if t.get("side") == "Buy" else -1
@@ -2395,9 +2396,16 @@ def _close_one_trade_at_market(t, current_price, current_dt, chain_df, reason="m
 
 
 def _trade_datetime_text(t, which):
-    """Human-readable simulated market date/time for a trade; backward-compatible with old sessions."""
+    """
+    Human-readable simulated market date/time.
+
+    New trades store entry_dt/exit_dt explicitly. For older trades created before
+    Build 2.6.0, recover a missing exit date from entry_dt + holding_minutes when
+    possible, instead of displaying only HH:MM:SS.
+    """
     iso_key = "entry_dt" if which == "entry" else "exit_dt"
     legacy_key = "entry_time" if which == "entry" else "exit_time"
+
     raw = t.get(iso_key)
     if raw:
         try:
@@ -2405,6 +2413,18 @@ def _trade_datetime_text(t, which):
             return dt.strftime("%d-%m-%Y %H:%M:%S")
         except Exception:
             return str(raw)
+
+    # Repair display for old closed trades whose single-Exit path stored only exit_time.
+    if which == "exit":
+        entry_raw = t.get("entry_dt")
+        holding = t.get("holding_minutes")
+        if entry_raw and holding is not None:
+            try:
+                inferred = pd.to_datetime(entry_raw) + pd.to_timedelta(float(holding), unit="m")
+                return inferred.strftime("%d-%m-%Y %H:%M:%S")
+            except Exception:
+                pass
+
     legacy = t.get(legacy_key)
     if legacy and legacy != "-":
         return str(legacy)
@@ -2723,7 +2743,7 @@ def main():
     st.markdown("""
     <div class="fixed-header">
         <h1>NIFTY Options Trading Simulator</h1>
-        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.5.1</p>
+        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.6.0</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -4182,13 +4202,14 @@ def main():
         # ---------- TAB 5: LEADERBOARD ----------
         with tab_leaderboard:
             st.markdown(
-                '<div class="section-title">Top 5 — Best Single-Session Realized P&L</div>',
+                '<div class="section-title">Top 5 — Best Single-Session Realized Return</div>',
                 unsafe_allow_html=True
             )
             st.caption(
-                "Within each 5-day market run, realized P&L accumulates across all closed trades. "
-                "When a new 5-day run starts, its P&L begins again from zero. Sessions are never added together: "
-                "each student's leaderboard score is the highest realized P&L from any one independent session."
+                "Ranking is based on realized P&L as a percentage of the session's initial capital, "
+                "so students who choose different starting capital are compared fairly. "
+                "Each 5-day market run is independent; sessions are never added together. "
+                "Absolute realized P&L is shown for context but does not determine rank."
             )
 
             def _draw_leaderboard():
@@ -4198,7 +4219,8 @@ def main():
                     preferred = [
                         c for c in [
                             "rank", "student_id", "student_name",
-                            "best_session_profit", "best_session_no",
+                            "best_session_return_pct", "best_session_profit",
+                            "initial_capital", "best_session_no",
                             "best_session_status", "closed_trades",
                             "win_rate_pct", "max_drawdown_pct"
                         ]
@@ -4208,7 +4230,9 @@ def main():
                         "rank": "Rank",
                         "student_id": "Student ID",
                         "student_name": "Student Name",
-                        "best_session_profit": "Best Realized P&L (₹)",
+                        "best_session_return_pct": "Best Realized Return %",
+                        "best_session_profit": "Realized P&L (₹)",
+                        "initial_capital": "Initial Capital (₹)",
                         "best_session_no": "Best Session",
                         "best_session_status": "Session Status",
                         "closed_trades": "Closed Trades",
@@ -4220,7 +4244,9 @@ def main():
                         use_container_width=True,
                         hide_index=True,
                         column_config={
-                            "Best Realized P&L (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Best Realized Return %": st.column_config.NumberColumn(format="%.2f%%"),
+                            "Realized P&L (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Initial Capital (₹)": st.column_config.NumberColumn(format="₹%.0f"),
                             "Win Rate %": st.column_config.NumberColumn(format="%.1f%%"),
                             "Max Drawdown %": st.column_config.NumberColumn(format="%.2f%%"),
                         },
