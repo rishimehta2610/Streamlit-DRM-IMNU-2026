@@ -20,7 +20,7 @@ from supabase import create_client
 
 # ============ PAGE CONFIG ============
 st.set_page_config(
-    page_title="NIFTY Options Trading Simulator",
+    page_title="Option Market Simulator (Live Trading Simulator)",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -29,38 +29,17 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER
 # ==========================================================
-APP_VERSION = "v1.1.1"
+APP_VERSION = "v1.0"
 SUPABASE_REPORT_BUCKET = "session-reports"
-
-def _normalize_supabase_url(raw_url):
-    """Normalize a copied Supabase URL to the project root expected by supabase-py.
-
-    Accepts either the project URL (recommended) or a Data API URL copied from
-    the dashboard such as https://<ref>.supabase.co/rest/v1 and safely reduces
-    it to https://<ref>.supabase.co.
-    """
-    url = str(raw_url or "").strip().strip('"').strip("'")
-    if not url:
-        return ""
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    # The Python client appends /rest/v1 itself. Supplying a Data API endpoint
-    # here would otherwise create an invalid path such as /rest/v1/rest/v1.
-    for marker in ("/rest/v1", "/auth/v1", "/storage/v1"):
-        if marker in url:
-            url = url.split(marker, 1)[0]
-    return url.rstrip("/")
 
 @st.cache_resource
 def get_supabase():
     """Create one server-side Supabase client from Streamlit Secrets."""
     try:
-        raw_url = st.secrets["supabase"]["url"]
-        secret_key = str(st.secrets["supabase"]["key"]).strip()
-        project_url = _normalize_supabase_url(raw_url)
-        if not project_url or ".supabase.co" not in project_url or not secret_key:
-            return None
-        return create_client(project_url, secret_key)
+        return create_client(
+            st.secrets["supabase"]["url"],
+            st.secrets["supabase"]["key"]
+        )
     except Exception:
         return None
 
@@ -842,45 +821,6 @@ div[data-testid="stMetricValue"] {
 .glossary-term:focus .glossary-tip {
     display: block;
 }
-
-/* Inline basket-leg editor */
-.edit-leg-box {
-    background: #fffdf5;
-    border: 1px solid #f0e2a8;
-    border-radius: 8px;
-    padding: 10px 12px 4px 12px;
-    margin: -2px 0 8px 0;
-}
-
-/* ===== UI refinement: restrained academic trading terminal ===== */
-html, body, [class*="css"] { font-family: Inter, "Segoe UI", Arial, sans-serif; }
-.stApp { color: #17202a !important; }
-.main .block-container { max-width: 1440px !important; padding-left: 18px !important; padding-right: 18px !important; }
-.fixed-header { min-height: 48px; padding: 9px 20px; border-radius: 0; box-shadow: 0 1px 4px rgba(10,37,64,0.16); }
-.fixed-header h1 { font-size: 16px; letter-spacing: 0.1px; }
-.fixed-header p { font-size: 11px; color: #c7d8e8; }
-.card, .card-beige, .order-card, .strategy-card, .preview-box, .margin-box { border-radius: 8px; box-shadow: none; }
-.card { border-color: #dfe5eb; }
-.card-beige { background: #fbfaf7; }
-.stButton > button { border-radius: 6px !important; min-height: 38px; box-shadow: none !important; letter-spacing: 0; }
-.stButton > button:hover { transform: none; box-shadow: none !important; }
-.stTabs [data-baseweb="tab-list"] { border-radius: 6px; padding: 3px; }
-.stTabs [data-baseweb="tab"] { border-radius: 4px; }
-.section-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.45px; color: #34495e; margin-top: 16px; }
-.subsection-title { color: #425466; }
-.hint-line, .strategy-note, .preview-hint { color: #657786; }
-.disclaimer-banner { background: #fff7ed; color: #7c4a03; border: 1px solid #efd8b4; border-left: 3px solid #c98a2e; border-radius: 5px; text-align: left; font-weight: 500; padding: 7px 12px; }
-div[data-testid="stTextInput"] label, div[data-testid="stNumberInput"] label, div[data-testid="stSelectbox"] label, div[data-testid="stSlider"] label, div[data-testid="stCheckbox"] label, div[data-testid="stFileUploader"] label { color: #263645 !important; font-weight: 600 !important; }
-div[data-testid="stTextInput"] input, div[data-testid="stNumberInput"] input { background: #ffffff !important; color: #17202a !important; border: 1px solid #cbd5df !important; border-radius: 6px !important; -webkit-text-fill-color: #17202a !important; }
-div[data-testid="stTextInput"] input:focus, div[data-testid="stNumberInput"] input:focus { border-color: #387ed1 !important; box-shadow: 0 0 0 1px #387ed1 !important; }
-div[data-testid="stForm"] { max-width: 720px; margin: 8px auto 24px auto; padding: 24px 26px 20px 26px; background: #ffffff; border: 1px solid #dfe5eb; border-radius: 9px; box-shadow: 0 8px 24px rgba(10,37,64,0.06); }
-.identity-title { max-width: 720px; margin: 20px auto 2px auto; font-size: 22px; font-weight: 700; color: #0a2540; }
-.identity-subtitle { max-width: 720px; margin: 0 auto 12px auto; font-size: 13px; color: #5e6c78; line-height: 1.55; }
-div[data-testid="stForm"] div[data-testid="stMarkdownContainer"] p { color: #34495e !important; }
-div[data-testid="stForm"] [data-testid="stCheckbox"] p { color: #34495e !important; }
-div[data-testid="stForm"] button[kind="primary"] { background: #0a2540 !important; color: #ffffff !important; }
-div[data-testid="stForm"] button[kind="primary"]:hover { background: #123a60 !important; }
-
 </style>
 """
 
@@ -926,11 +866,6 @@ defaults = {
     'report_generated': False,
     'report_path': None,
     'df_raw': None,
-    'participant_id': None,
-    'student_name': '',
-    'student_id': '',
-    'student_email': '',
-    'supabase_session_id': None,
     'df_day_scaled': None,
     'current_price': DEFAULT_OPEN_PRICE,
     'T_current': TOTAL_EXPIRY_DAYS / 365,
@@ -940,7 +875,11 @@ defaults = {
     'session_start_wall': None,
     'data_source_choice': None,   # 'upload' | 'path' | 'garch'
     'day_close_map': {},          # day_num -> previous day's close for change calc
-    'editing_basket_idx': None,   # index of the basket leg currently being edited inline, if any
+    'participant_id': None,
+    'student_name': '',
+    'student_id': '',
+    'student_email': '',
+    'supabase_session_id': None,
 }
 
 for k, v in defaults.items():
@@ -1995,38 +1934,36 @@ def main():
     # Fixed Header
     st.markdown("""
     <div class="fixed-header">
-        <h1>NIFTY Options Trading Simulator</h1>
-        <p>DRM IMBA 2026 · Academic simulation environment</p>
+        <h1>Option Market Simulator (Live Trading Simulator)</h1>
+        <p>Developed by Prof. Bhavesh (IMNU) · classroom teaching tool</p>
     </div>
     """, unsafe_allow_html=True)
 
     # Persistent disclaimer — required to stay visible on every screen (Section 4.1 of guidelines)
     st.markdown("""
     <div class="disclaimer-banner">
-        Academic simulation only. Not intended for commercial or live trading use. Prices, margin and P&amp;L are simulated and do not represent a broker, exchange or live market.
+        ⚠️ Developed for classroom use only — not for commercial or live trading use.
+        Prices, margin, and P&amp;L are simulated for learning purposes and do not reflect a
+        real broker, exchange, or live market.
     </div>
     """, unsafe_allow_html=True)
 
     # ===== STUDENT IDENTIFICATION / CLOUD SESSION OWNERSHIP =====
     if supabase_enabled() and not st.session_state.get("participant_id"):
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("""
-        <div class="identity-title">Student Access</div>
-        <div class="identity-subtitle">
-            Enter your details to begin. Your session and trading activity will be retained for academic review.
-        </div>
-        """, unsafe_allow_html=True)
+        st.markdown("### Student Identification")
         st.caption(
-            "Session records are linked to your Student ID. Email is optional."
+            "Your simulator session, orders, trades, performance summary and final report "
+            "will be recorded for academic/classroom use."
         )
         with st.form("student_identity_form", clear_on_submit=False):
-            student_name = st.text_input("Full Name *", value=st.session_state.get("student_name", ""))
-            student_id = st.text_input("Student ID / Roll No. *", value=st.session_state.get("student_id", ""))
+            student_name = st.text_input("Full name *", value=st.session_state.get("student_name", ""))
+            student_id = st.text_input("Student ID *", value=st.session_state.get("student_id", ""))
             student_email = st.text_input("Email (optional)", value=st.session_state.get("student_email", ""))
             consent = st.checkbox(
-                "I understand that my trading activity and performance will be recorded for academic evaluation."
+                "I understand that my simulator activity will be stored for classroom/academic review."
             )
-            submitted = st.form_submit_button("Start Trading Session", type="primary", use_container_width=True)
+            submitted = st.form_submit_button("Continue to Simulator", type="primary", use_container_width=True)
 
         if submitted:
             if not student_name.strip() or not student_id.strip():
@@ -2046,16 +1983,7 @@ def main():
                     st.session_state.student_email = student_email.strip().lower()
                     st.rerun()
                 except Exception as exc:
-                    msg = str(exc)
-                    if "PGRST125" in msg or "Invalid path specified in request URL" in msg:
-                        st.error(
-                            "Supabase connection URL is not in the expected project format. "
-                            "The app has normalized common Data API URLs automatically; please refresh once. "
-                            "If this persists, the Streamlit secret `supabase.url` should be your project root, "
-                            "for example `https://your-project-ref.supabase.co`."
-                        )
-                    else:
-                        st.error("Could not register the student in Supabase. Please try again or contact the app administrator.")
+                    st.error(f"Could not register the student in Supabase: {exc}")
         st.markdown('</div>', unsafe_allow_html=True)
         return
     elif not supabase_enabled():
@@ -2089,31 +2017,9 @@ def main():
                                        placeholder="/path/to/your/data.txt")
         with c2:
             uploaded = st.file_uploader("Or upload data file (optional)", type=["txt", "csv"], key="setup_upload")
-
-        c3, c4, c5 = st.columns(3)
-        with c3:
-            open_price_input = st.number_input("Opening price", min_value=1.0, value=DEFAULT_OPEN_PRICE, step=50.0, key="setup_open")
-        with c4:
-            capital_input = st.number_input(
-                "Starting capital (₹)", min_value=100000.0, value=float(st.session_state.get('starting_capital', 10000000.0)),
-                step=100000.0, format="%.0f", key="setup_capital",
-                help="Lower this to make margin limits actually bite during the session — the ₹1 Cr default rarely runs out."
-            )
-        with c5:
-            lot_size_input = st.number_input(
-                "Lot size", min_value=1, value=int(st.session_state.get('lot_size', 65)),
-                step=5, key="setup_lot_size",
-                help="Contract multiplier per lot. NIFTY's exchange-set lot size has varied historically; 65 mirrors a recent value."
-            )
-        st.caption(
-            f"💡 With ₹{capital_input:,.0f} capital and a {lot_size_input}-lot size, a single naked short option "
-            f"leg needs roughly ₹{lot_size_input * open_price_input * 0.10:,.0f}+ margin — lower the capital "
-            f"above if you want students to hit a margin limit during the session."
-        )
+        open_price_input = st.number_input("Opening price", min_value=1.0, value=DEFAULT_OPEN_PRICE, step=50.0, key="setup_open")
 
         if st.button("Start Session", type="primary", use_container_width=True, key="btn_start_session"):
-            st.session_state.starting_capital = float(capital_input)
-            st.session_state.lot_size = int(lot_size_input)
             df = None
             source = "garch"
             user_supplied_but_failed = False
@@ -2299,7 +2205,7 @@ def main():
         if st.session_state.trading_locked or st.session_state.current_index >= n_bars - 1:
             _day_extra = " &nbsp;·&nbsp; <span style='color:#ffab40'>SESSION CLOSED</span>"
         st.markdown(f"""
-        <div style="background:#0a2540;color:#e8f0fe;border-radius:10px;padding:8px 14px;margin-bottom:10px;
+        <div style="background:linear-gradient(90deg,#0a1628,#12263a);color:#e8f0fe;border-radius:10px;padding:8px 14px;margin-bottom:10px;
                     text-align:center;font-weight:700;font-size:15px;letter-spacing:0.3px;border:1px solid #1e3a5f;">
             TRADING DAY &nbsp;·&nbsp; Day-{current_day_num}{_day_extra}
         </div>
@@ -2373,13 +2279,13 @@ def main():
             }
             </style>
             """, unsafe_allow_html=True)
-            if st.button("GO LIVE", use_container_width=True, type="primary", key="btn_golive",
+            if st.button("▶  GO LIVE", use_container_width=True, type="primary", key="btn_golive",
                          disabled=st.session_state.trading_locked):
                 st.session_state.playing = True
                 st.session_state.last_update = time.time()
                 st.rerun()
         else:
-            if st.button("PAUSE", use_container_width=True, key="btn_pause"):
+            if st.button("⏸  PAUSE", use_container_width=True, key="btn_pause"):
                 st.session_state.playing = False
                 save_session_state()
                 st.rerun()
@@ -2424,7 +2330,7 @@ def main():
 
         # Reset high-contrast
         st.markdown('<div class="reset-btn-container">', unsafe_allow_html=True)
-        if st.button("RESET SESSION", use_container_width=True, key="btn_reset"):
+        if st.button("🔄 RESET SESSION", use_container_width=True, key="btn_reset"):
             # Close the current database session as a reset/abandoned run before starting a fresh one.
             if supabase_enabled() and st.session_state.get("supabase_session_id"):
                 try:
@@ -2575,7 +2481,7 @@ def main():
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander("View payoff diagram for this order"):
+            with st.expander("📈 Show payoff diagram for this order"):
                 fig_leg, _ = render_payoff_diagram(_trial_items, current_price, title=f"{side} {strike} {otype} — Payoff at Expiry")
                 st.plotly_chart(fig_leg, use_container_width=True, config={'displayModeBar': False})
 
@@ -2808,7 +2714,7 @@ def main():
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander("View payoff diagram for this strategy"):
+            with st.expander("📈 Show payoff diagram for this strategy"):
                 fig_strat, _ = render_payoff_diagram(strat_items, current_price, title=f"{strat_name.split('(')[0].strip()} — Payoff at Expiry")
                 st.plotly_chart(fig_strat, use_container_width=True, config={'displayModeBar': False})
             if uses_fut:
@@ -2820,7 +2726,7 @@ def main():
                 unsafe_allow_html=True
             )
 
-            if st.button("Add Strategy to Basket", key="btn_add_strategy", type="secondary",
+            if st.button("➕ Add Strategy to Basket", key="btn_add_strategy", type="secondary",
                          use_container_width=True, disabled=st.session_state.trading_locked):
                 group_id = str(uuid.uuid4())
                 for strategy_item in strat_items:
@@ -2836,7 +2742,7 @@ def main():
             st.markdown('<div class="section-title">Basket <span style="font-weight:500;color:#888;font-size:11px;">— add multiple legs, then execute together</span></div>', unsafe_allow_html=True)
             if st.session_state.basket:
                 for i, item in enumerate(st.session_state.basket):
-                    cols = st.columns([4.3, 0.7, 0.7])
+                    cols = st.columns([5, 1])
                     with cols[0]:
                         side_cls = "item-side-buy" if item['side'] == 'Buy' else "item-side-sell"
                         st.markdown(
@@ -2850,48 +2756,9 @@ def main():
                             unsafe_allow_html=True
                         )
                     with cols[1]:
-                        if st.button("✏️", key=f"edit_basket_{i}", help="Edit this leg"):
-                            st.session_state.editing_basket_idx = None if st.session_state.editing_basket_idx == i else i
-                            st.rerun()
-                    with cols[2]:
-                        if st.button("✕", key=f"rm_basket_{i}", help="Remove this leg"):
+                        if st.button("✕", key=f"rm_basket_{i}"):
                             del st.session_state.basket[i]
-                            if st.session_state.editing_basket_idx == i:
-                                st.session_state.editing_basket_idx = None
                             st.rerun()
-
-                    if st.session_state.editing_basket_idx == i:
-                        st.markdown('<div class="edit-leg-box">', unsafe_allow_html=True)
-                        ec1, ec2 = st.columns(2)
-                        with ec1:
-                            new_lots = st.number_input(
-                                "Lots", min_value=1, value=int(item['lots']), step=1, key=f"edit_lots_{i}"
-                            )
-                        with ec2:
-                            if item['type'] != 'FUT':
-                                new_price = st.number_input(
-                                    "Price (₹)", min_value=0.05, value=float(item['price']), step=0.05, key=f"edit_price_{i}"
-                                )
-                                st.caption("Saving a changed price turns this into a LIMIT leg at that price.")
-                            else:
-                                new_price = item['price']
-                                st.caption("The underlying leg marks to live spot — price isn't editable here.")
-                        esave, ecancel = st.columns(2)
-                        with esave:
-                            if st.button("Save Changes", key=f"save_edit_{i}", type="primary", use_container_width=True):
-                                st.session_state.basket[i]['lots'] = int(new_lots)
-                                st.session_state.basket[i]['quantity'] = int(new_lots) * lot_size
-                                if item['type'] != 'FUT' and float(new_price) != float(item['price']):
-                                    st.session_state.basket[i]['price'] = float(new_price)
-                                    st.session_state.basket[i]['order_type'] = 'LIMIT'
-                                st.session_state.editing_basket_idx = None
-                                st.toast("Leg updated", icon="✏️")
-                                st.rerun()
-                        with ecancel:
-                            if st.button("Cancel", key=f"cancel_edit_{i}", use_container_width=True):
-                                st.session_state.editing_basket_idx = None
-                                st.rerun()
-                        st.markdown('</div>', unsafe_allow_html=True)
 
                 margin_req = calculate_realistic_margin(
                     list(st.session_state.positions) + list(st.session_state.basket),
@@ -2924,7 +2791,7 @@ def main():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                with st.expander("View combined payoff diagram", expanded=False):
+                with st.expander("📈 Show combined payoff diagram for the whole basket", expanded=False):
                     fig_basket, _ = render_payoff_diagram(st.session_state.basket, current_price, title="Basket — Combined Payoff at Expiry")
                     st.plotly_chart(fig_basket, use_container_width=True, config={'displayModeBar': False})
 
@@ -2957,7 +2824,7 @@ def main():
                         st.rerun()
             else:
                 st.markdown(
-                    '<div class="empty-box">Basket is empty. Build multi-leg orders (e.g. a spread) '
+                    '<div class="empty-box">🧺 Basket is empty. Build multi-leg orders (e.g. a spread) '
                     'by choosing an option above and clicking <b>Add to Basket</b> for each leg, '
                     'then execute them together.</div>',
                     unsafe_allow_html=True
@@ -2995,7 +2862,7 @@ def main():
                             st.rerun()
             else:
                 st.markdown(
-                    '<div class="empty-box">No pending limit orders. A limit order waits here until '
+                    '<div class="empty-box">📋 No pending limit orders. A limit order waits here until '
                     'the market price reaches your price.</div>',
                     unsafe_allow_html=True
                 )
@@ -3262,7 +3129,7 @@ def main():
             if _model_pdf:
                 with open(_model_pdf, "rb") as _mf:
                     st.download_button(
-                        "Download Model Specification (PDF)",
+                        "📄 Download Model Specification (PDF)",
                         _mf,
                         file_name="Model_Math.pdf",
                         mime="application/pdf",
@@ -3275,7 +3142,7 @@ def main():
             # Finish & Report
             st.markdown('<div class="section-title">Finish Session & Report</div>', unsafe_allow_html=True)
             if not st.session_state.session_finished:
-                if st.button("Finish Session & Generate PDF Report", use_container_width=True, type="primary", key="btn_finish"):
+                if st.button("🏁 Finish Session & Generate PDF Report", use_container_width=True, type="primary", key="btn_finish"):
                     cancel_pending_order_records(st.session_state.get("pending_limits", []), "finish_session")
                     st.session_state.pending_limits = []
                     # Close remaining
@@ -3322,13 +3189,13 @@ def main():
                         st.success(f"Report generated: {fname}")
                         if os.path.exists(path):
                             with open(path, "rb") as f:
-                                st.download_button("Download PDF Report", f, file_name=fname, mime="application/pdf")
+                                st.download_button("📥 Download PDF Report", f, file_name=fname, mime="application/pdf")
                     st.rerun()
             else:
                 st.success("Session finished. Report available.")
                 if st.session_state.report_path and os.path.exists(st.session_state.report_path):
                     with open(st.session_state.report_path, "rb") as f:
-                        st.download_button("Download PDF Report", f,
+                        st.download_button("📥 Download PDF Report", f,
                                            file_name=os.path.basename(st.session_state.report_path),
                                            mime="application/pdf")
 
