@@ -15,38 +15,97 @@ import io
 from fpdf import FPDF
 import base64
 import uuid
+import re
 import streamlit.components.v1 as components
 from supabase import create_client
 
 # ============ PAGE CONFIG ============
 st.set_page_config(
-    page_title="Option Market Simulator (Live Trading Simulator)",
+    page_title="NIFTY Options Trading Simulator",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
 
 # ==========================================================
-# SUPABASE PERSISTENCE LAYER
+# SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v1.0"
+APP_VERSION = "v2.0"
 SUPABASE_REPORT_BUCKET = "session-reports"
+
+
+def _normalize_supabase_url(raw_url):
+    """
+    Return ONLY the Supabase project-root URL required by supabase-py.
+
+    Accepts a normal project URL, a /rest/v1 URL, a Supabase dashboard
+    project URL, a bare project reference, or values pasted with labels/quotes.
+    """
+    raw = str(raw_url or "").strip()
+    if not raw:
+        return ""
+
+    host_match = re.search(
+        r"https?://([a-z0-9-]+)\.supabase\.co",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if host_match:
+        return f"https://{host_match.group(1).lower()}.supabase.co"
+
+    dashboard_match = re.search(
+        r"(?:dashboard/)?project/([a-z0-9-]{10,})",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if dashboard_match:
+        return f"https://{dashboard_match.group(1).lower()}.supabase.co"
+
+    bare = raw.strip().strip('"').strip("'").strip("/")
+    if re.fullmatch(r"[a-z0-9-]{10,}", bare, flags=re.IGNORECASE):
+        return f"https://{bare.lower()}.supabase.co"
+
+    return ""
+
+
+def _normalize_supabase_key(raw_key):
+    """Extract the actual Supabase API key if labels or quotes were pasted with it."""
+    raw = str(raw_key or "").strip()
+    if not raw:
+        return ""
+
+    modern = re.search(r"(sb_(?:secret|publishable)_[A-Za-z0-9._-]+)", raw)
+    if modern:
+        return modern.group(1)
+
+    legacy = re.search(r"(eyJ[A-Za-z0-9._-]+)", raw)
+    if legacy:
+        return legacy.group(1)
+
+    return raw.strip().strip('"').strip("'")
+
 
 @st.cache_resource
 def get_supabase():
-    """Create one server-side Supabase client from Streamlit Secrets."""
     try:
-        return create_client(
-            st.secrets["supabase"]["url"],
-            st.secrets["supabase"]["key"]
-        )
-    except Exception:
+        project_url = _normalize_supabase_url(st.secrets["supabase"]["url"])
+        secret_key = _normalize_supabase_key(st.secrets["supabase"]["key"])
+
+        if not project_url or not secret_key:
+            print("[Supabase] Invalid or missing project URL / API key in Streamlit Secrets.")
+            return None
+
+        return create_client(project_url, secret_key)
+    except Exception as exc:
+        print(f"[Supabase] Client initialization failed: {exc}")
         return None
+
 
 supabase = get_supabase()
 
 def supabase_enabled():
     return supabase is not None
+
 
 def _iso(value):
     if value is None:
@@ -57,271 +116,451 @@ def _iso(value):
         return value.isoformat()
     return str(value)
 
+
 def _sb_data(response):
     data = getattr(response, "data", None)
     return data if data is not None else []
 
+
 def test_supabase_connection():
-    """Lightweight end-to-end check against the participants table."""
     if not supabase_enabled():
         return False, "Supabase secrets/client are unavailable."
     try:
         supabase.table("participants").select("id").limit(1).execute()
         return True, None
     except Exception as exc:
+        print(f"[Supabase] Connection/query test failed: {exc}")
         return False, str(exc)
 
+
+def get_participant_by_student_id(student_id):
+    """Fetch an existing student profile using the stable roll-number key."""
+    if not supabase_enabled() or not str(student_id or "").strip():
+        return None
+    resp = (
+        supabase.table("participants")
+        .select("id,student_name,student_id,email,last_active_at")
+        .eq("student_id", str(student_id).strip())
+        .limit(1)
+        .execute()
+    )
+    rows = _sb_data(resp)
+    return rows[0] if rows else None
+
+
 def create_or_get_participant(student_name, student_id, email=""):
-    """Return a participant UUID, reusing an existing student_id/email where possible."""
+    """Create a new student once; otherwise retrieve and refresh the existing profile."""
     if not supabase_enabled():
         return None
     student_name = (student_name or "").strip()
     student_id = (student_id or "").strip()
     email = (email or "").strip().lower()
-
-    # Prefer college/student ID as the stable identity key.
-    if student_id:
-        resp = (
-            supabase.table("participants")
-            .select("id,student_name,student_id,email")
-            .eq("student_id", student_id)
-            .limit(1)
-            .execute()
-        )
-        rows = _sb_data(resp)
-        if rows:
-            pid = rows[0]["id"]
-            updates = {"student_name": student_name}
-            if email:
-                updates["email"] = email
-            try:
-                supabase.table("participants").update(updates).eq("id", pid).execute()
-            except Exception:
-                pass
-            return pid
-
-    if email:
-        resp = (
-            supabase.table("participants")
-            .select("id,student_name,student_id,email")
-            .eq("email", email)
-            .limit(1)
-            .execute()
-        )
-        rows = _sb_data(resp)
-        if rows:
-            pid = rows[0]["id"]
-            updates = {"student_name": student_name}
-            if student_id:
-                updates["student_id"] = student_id
-            try:
-                supabase.table("participants").update(updates).eq("id", pid).execute()
-            except Exception:
-                pass
-            return pid
+    existing = get_participant_by_student_id(student_id)
+    now = datetime.now().isoformat()
+    if existing:
+        updates = {"last_active_at": now}
+        # Preserve the stored name unless a non-empty corrected name was supplied.
+        if student_name and student_name != existing.get("student_name"):
+            updates["student_name"] = student_name
+        if email and email != (existing.get("email") or ""):
+            updates["email"] = email
+        try:
+            supabase.table("participants").update(updates).eq("id", existing["id"]).execute()
+        except Exception:
+            pass
+        return {**existing, **updates}
 
     payload = {
         "student_name": student_name,
-        "student_id": student_id or None,
+        "student_id": student_id,
         "email": email or None,
+        "last_active_at": now,
     }
-    resp = supabase.table("participants").insert(payload).select("id").execute()
+    resp = supabase.table("participants").insert(payload).select("id,student_name,student_id,email,last_active_at").execute()
     rows = _sb_data(resp)
-    return rows[0]["id"] if rows else None
+    return rows[0] if rows else None
+
+
+def _next_session_no(participant_id):
+    if not supabase_enabled() or not participant_id:
+        return 1
+    try:
+        rows = _sb_data(
+            supabase.table("student_sessions")
+            .select("id")
+            .eq("participant_id", participant_id)
+            .execute()
+        )
+        return len(rows) + 1
+    except Exception:
+        return 1
+
 
 def create_session_record():
-    """Create a Supabase session after the simulator price path has been initialized."""
+    """Create one clean analytical row per simulator run."""
     if not supabase_enabled() or not st.session_state.get("participant_id"):
         return None
+    participant_id = st.session_state.participant_id
     payload = {
-        "participant_id": st.session_state.participant_id,
+        "participant_id": participant_id,
+        "session_no": _next_session_no(participant_id),
         "app_version": APP_VERSION,
         "status": "active",
-        "data_source": st.session_state.get("data_source_choice") or "garch",
-        "target_open_price": float(st.session_state.get("target_nifty_level", DEFAULT_OPEN_PRICE)),
-        "scale_factor": float(st.session_state.get("scale_factor", 1.0)),
-        "simulation_start": _iso(st.session_state.get("start_time")),
-        "simulation_end": _iso(st.session_state.get("session_end")),
-        "expiry_at": _iso(st.session_state.get("expiry_dt")),
-        "lot_size": int(st.session_state.get("lot_size", 65)),
+        "strategy_focus": st.session_state.get("strategy_focus") or "Open practice",
         "starting_capital": float(st.session_state.get("starting_capital", 10000000.0)),
     }
-    resp = supabase.table("sessions").insert(payload).select("id").execute()
+    resp = supabase.table("student_sessions").insert(payload).select("id,session_no").execute()
     rows = _sb_data(resp)
-    sid = rows[0]["id"] if rows else None
-    st.session_state.supabase_session_id = sid
-    return sid
+    if not rows:
+        return None
+    st.session_state.supabase_session_id = rows[0]["id"]
+    st.session_state.session_no = rows[0].get("session_no")
+    save_progress_snapshot()
+    return rows[0]["id"]
+
 
 def ensure_session_record():
-    """Make sure the current browser trading session has a database session row."""
     if st.session_state.get("supabase_session_id"):
         return st.session_state.supabase_session_id
     return create_session_record()
 
-def save_order_record(item, status, current_dt=None, current_price=None,
-                      fill_price=None, rejection_reason=None):
-    if not supabase_enabled() or not st.session_state.get("supabase_session_id"):
+
+# Orders are intentionally NOT persisted in v2. Only executed trades are analytical records.
+def save_order_record(*args, **kwargs):
+    return None
+
+
+def update_order_record(*args, **kwargs):
+    return None
+
+
+def cancel_pending_order_records(*args, **kwargs):
+    return None
+
+
+def _estimate_trade_capital(item, spot):
+    """Estimate capital committed at entry; long premium or standalone short margin."""
+    qty = int(item.get("quantity", 0) or 0)
+    entry = float(item.get("price", item.get("entry_price", 0.0)) or 0.0)
+    if item.get("side") == "Buy" or item.get("type") == "FUT":
+        if item.get("type") == "FUT":
+            return max(abs(float(spot or 0.0) * qty * 0.12), 1.0)
+        return max(abs(entry * qty), 1.0)
+    try:
+        return max(float(calculate_realistic_margin([item], float(spot), int(st.session_state.get("lot_size", 65)))), 1.0)
+    except Exception:
+        return max(abs(entry * qty), 1.0)
+
+
+def _strategy_label(item):
+    if item.get("strategy_name"):
+        return str(item["strategy_name"])
+    source = item.get("order_source", "manual")
+    return "Manual trade" if source == "manual" else source.replace("_", " ").title()
+
+
+def save_trade_record(item, current_dt, order_id=None, current_price=None):
+    """Persist only an executed trade in an Excel-friendly schema."""
+    sid = st.session_state.get("supabase_session_id")
+    pid = st.session_state.get("participant_id")
+    if not supabase_enabled() or not sid or not pid:
         return None
+    capital_used = _estimate_trade_capital(item, current_price)
+    trade_no = len(st.session_state.get("tradebook", [])) + 1
+    instrument = instrument_label(item.get("strike", 0), item.get("type"))
     payload = {
-        "session_id": st.session_state.supabase_session_id,
-        "order_group_id": item.get("order_group_id"),
-        "strategy_name": item.get("strategy_name"),
-        "order_source": item.get("order_source", "manual"),
-        "executed_at": _iso(current_dt) if status == "filled" else None,
-        "side": item["side"],
+        "session_id": sid,
+        "participant_id": pid,
+        "trade_no": trade_no,
+        "strategy_name": _strategy_label(item),
+        "instrument": instrument,
         "instrument_type": item["type"],
         "strike": None if item["type"] == "FUT" else float(item.get("strike", 0)),
+        "side": item["side"],
         "lots": int(item.get("lots", 1)),
         "quantity": int(item.get("quantity", 0)),
-        "order_type": item.get("order_type", "MARKET"),
-        "requested_price": float(item.get("price", 0.0)),
-        "ltp_at_order": float(item.get("ltp", item.get("price", 0.0))),
-        "spot_at_order": float(current_price) if current_price is not None else None,
-        "fill_price": float(fill_price) if fill_price is not None else None,
-        "status": status,
-        "rejection_reason": rejection_reason,
-    }
-    resp = supabase.table("orders").insert(payload).select("id").execute()
-    rows = _sb_data(resp)
-    return rows[0]["id"] if rows else None
-
-def update_order_record(order_id, **fields):
-    if not supabase_enabled() or not order_id:
-        return
-    clean = {k: v for k, v in fields.items() if v is not None}
-    if clean:
-        supabase.table("orders").update(clean).eq("id", order_id).execute()
-
-def cancel_pending_order_records(items, reason="cancelled"):
-    """Close database order rows when local pending limits are cancelled."""
-    if not supabase_enabled():
-        return
-    for item in list(items or []):
-        order_id = item.get("supabase_order_id")
-        if not order_id:
-            continue
-        try:
-            update_order_record(
-                order_id,
-                status="cancelled",
-                cancelled_at=datetime.now().isoformat(),
-                rejection_reason=reason
-            )
-        except Exception:
-            pass
-
-def save_trade_record(item, current_dt, order_id=None):
-    if not supabase_enabled() or not st.session_state.get("supabase_session_id"):
-        return None
-    payload = {
-        "session_id": st.session_state.supabase_session_id,
-        "order_id": order_id,
         "entry_at": _iso(current_dt),
-        "instrument_type": item["type"],
-        "strike": None if item["type"] == "FUT" else float(item.get("strike", 0)),
-        "side": item["side"],
-        "lots": int(item.get("lots", 1)),
-        "quantity": int(item.get("quantity", 0)),
         "entry_price": float(item.get("price", 0.0)),
+        "capital_used": capital_used,
         "pnl": 0.0,
+        "return_pct": 0.0,
+        "max_drawdown": 0.0,
+        "max_drawdown_pct": 0.0,
+        "max_profit_seen": 0.0,
+        "holding_minutes": 0.0,
         "status": "Open",
     }
-    resp = supabase.table("trades").insert(payload).select("id").execute()
+    resp = supabase.table("student_trades").insert(payload).select("id").execute()
     rows = _sb_data(resp)
     return rows[0]["id"] if rows else None
 
+
 def close_trade_record(tradebook_row, current_dt, exit_price, exit_reason):
-    """Mirror a locally-closed trade into Supabase."""
     trade_id = tradebook_row.get("supabase_trade_id")
     if not supabase_enabled() or not trade_id:
         return
+    pnl = float(tradebook_row.get("pnl", 0.0))
+    capital_used = max(float(tradebook_row.get("capital_used", 0.0) or 0.0), 1.0)
+    holding_minutes = float(tradebook_row.get("holding_minutes", 0.0) or 0.0)
+    entry_dt_raw = tradebook_row.get("entry_dt")
+    if entry_dt_raw:
+        try:
+            entry_dt = datetime.fromisoformat(str(entry_dt_raw))
+            holding_minutes = max(0.0, (current_dt - entry_dt).total_seconds() / 60.0)
+        except Exception:
+            pass
     payload = {
         "exit_at": _iso(current_dt),
         "exit_price": float(exit_price),
-        "pnl": float(tradebook_row.get("pnl", 0.0)),
+        "pnl": pnl,
+        "return_pct": pnl / capital_used * 100.0,
+        "max_drawdown": float(tradebook_row.get("max_drawdown", 0.0) or 0.0),
+        "max_drawdown_pct": float(tradebook_row.get("max_drawdown_pct", 0.0) or 0.0),
+        "max_profit_seen": float(tradebook_row.get("max_profit_seen", 0.0) or 0.0),
+        "holding_minutes": holding_minutes,
         "status": "Closed",
         "exit_reason": exit_reason,
     }
-    supabase.table("trades").update(payload).eq("id", trade_id).execute()
+    supabase.table("student_trades").update(payload).eq("id", trade_id).execute()
+
+
+def update_live_risk_metrics(current_price, current_dt, chain_df):
+    """Track trade-level MAE/max profit and session equity drawdown without excessive DB writes."""
+    for t in st.session_state.get("tradebook", []):
+        if t.get("status") != "Open":
+            continue
+        typ = t.get("type")
+        if typ == "FUT":
+            mark = float(current_price)
+        else:
+            row = chain_df[chain_df["Strike"] == t.get("strike")] if chain_df is not None else pd.DataFrame()
+            if len(row) == 0:
+                continue
+            mark = float(row.iloc[0]["CE Price"] if typ == "CE" else row.iloc[0]["PE Price"])
+        sign = 1 if t.get("side") == "Buy" else -1
+        pnl_now = sign * (mark - float(t.get("entry_price", 0.0))) * int(t.get("qty", 0))
+        t["max_drawdown"] = max(float(t.get("max_drawdown", 0.0)), max(0.0, -pnl_now))
+        t["max_profit_seen"] = max(float(t.get("max_profit_seen", 0.0)), pnl_now)
+        capital = max(float(t.get("capital_used", 0.0) or 0.0), 1.0)
+        t["max_drawdown_pct"] = t["max_drawdown"] / capital * 100.0
+        entry_dt_raw = t.get("entry_dt")
+        if entry_dt_raw:
+            try:
+                t["holding_minutes"] = max(0.0, (current_dt - datetime.fromisoformat(str(entry_dt_raw))).total_seconds() / 60.0)
+            except Exception:
+                pass
+
+
+def update_session_drawdown(open_pnl):
+    equity = float(st.session_state.get("starting_capital", 10000000.0)) + float(st.session_state.get("realized_pnl", 0.0)) + float(open_pnl)
+    peak = max(float(st.session_state.get("equity_peak", equity)), equity)
+    dd = max(0.0, peak - equity)
+    st.session_state.equity_peak = peak
+    st.session_state.max_drawdown = max(float(st.session_state.get("max_drawdown", 0.0)), dd)
+    st.session_state.max_drawdown_pct = max(
+        float(st.session_state.get("max_drawdown_pct", 0.0)),
+        (dd / peak * 100.0) if peak > 0 else 0.0,
+    )
+
 
 def finish_session_record(current_price=None, current_day_num=None, status="completed"):
-    """Persist the final session KPIs without deleting historical records."""
     sid = st.session_state.get("supabase_session_id")
     if not supabase_enabled() or not sid:
         return
-
     closed = [t for t in st.session_state.get("tradebook", []) if t.get("status") == "Closed"]
-    wins = sum(1 for t in closed if float(t.get("pnl", 0)) > 0)
-    losses = sum(1 for t in closed if float(t.get("pnl", 0)) < 0)
+    pnls = [float(t.get("pnl", 0.0)) for t in closed]
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
     realized = float(st.session_state.get("realized_pnl", 0.0))
-
-    # At formal completion all positions are closed; for reset/abandonment keep a mark-to-market snapshot if available.
-    open_pnl = 0.0
-    if st.session_state.get("positions") and current_price is not None and st.session_state.get("chain_df") is not None:
-        try:
-            cons = consolidate_positions(
-                st.session_state.positions,
-                current_price,
-                st.session_state.get("T_current", TOTAL_EXPIRY_DAYS / 365),
-                st.session_state.chain_df
-            )
-            open_pnl = float(sum(p["pnl"] for p in cons))
-        except Exception:
-            open_pnl = 0.0
-
-    total_pnl = realized + open_pnl
+    starting = float(st.session_state.get("starting_capital", 10000000.0))
+    total_pnl = realized
     peak_margin = float(st.session_state.get("peak_margin_used", 0.0))
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    holding = [float(t.get("holding_minutes", 0.0) or 0.0) for t in closed]
+    strategies = {str(t.get("strategy_name") or "Manual trade") for t in closed}
     payload = {
         "status": status,
         "ended_at": datetime.now().isoformat(),
-        "ending_equity": float(st.session_state.get("starting_capital", 10000000.0)) + total_pnl,
-        "realized_pnl": realized,
-        "open_pnl": open_pnl,
+        "reflection_note": st.session_state.get("reflection_note") or None,
+        "ending_equity": starting + total_pnl,
         "total_pnl": total_pnl,
+        "return_pct": (total_pnl / starting * 100.0) if starting > 0 else 0.0,
+        "max_drawdown": float(st.session_state.get("max_drawdown", 0.0)),
+        "max_drawdown_pct": float(st.session_state.get("max_drawdown_pct", 0.0)),
         "peak_margin_used": peak_margin,
         "return_on_margin_pct": (total_pnl / peak_margin * 100.0) if peak_margin > 0 else 0.0,
-        "total_trades": len(st.session_state.get("tradebook", [])),
-        "closed_trades": len(closed),
-        "winning_trades": wins,
-        "losing_trades": losses,
-        "win_rate_pct": (wins / len(closed) * 100.0) if closed else 0.0,
-        "final_nifty_price": float(current_price) if current_price is not None else None,
-        "final_trading_day": int(current_day_num) if current_day_num is not None else None,
-        "max_reached_index": int(st.session_state.get("max_reached_index", 0)),
-        "trading_locked": bool(st.session_state.get("trading_locked", False)),
-        "session_finished": bool(st.session_state.get("session_finished", False)),
-        "report_generated": bool(st.session_state.get("report_generated", False)),
+        "total_trades": len(closed),
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "win_rate_pct": (len(wins) / len(closed) * 100.0) if closed else 0.0,
+        "avg_profit_trade": (sum(wins) / len(wins)) if wins else 0.0,
+        "avg_loss_trade": (sum(losses) / len(losses)) if losses else 0.0,
+        "best_trade_pnl": max(pnls) if pnls else 0.0,
+        "worst_trade_pnl": min(pnls) if pnls else 0.0,
+        "profit_factor": (gross_profit / gross_loss) if gross_loss > 0 else (gross_profit if gross_profit > 0 else 0.0),
+        "avg_holding_minutes": (sum(holding) / len(holding)) if holding else 0.0,
+        "strategies_tried": len(strategies),
     }
-    supabase.table("sessions").update(payload).eq("id", sid).execute()
+    supabase.table("student_sessions").update(payload).eq("id", sid).execute()
+    if status != "active":
+        delete_progress_snapshot()
+
 
 def upload_report_record(filepath, filename):
-    """Upload the PDF to the private session-reports bucket and save report metadata."""
     sid = st.session_state.get("supabase_session_id")
-    if not supabase_enabled() or not sid or not filepath or not os.path.exists(filepath):
+    pid = st.session_state.get("participant_id")
+    if not supabase_enabled() or not sid or not pid or not filepath or not os.path.exists(filepath):
         return None
-
-    storage_path = f"{sid}/{filename}"
+    storage_path = f"{pid}/{sid}/{filename}"
     with open(filepath, "rb") as f:
         supabase.storage.from_(SUPABASE_REPORT_BUCKET).upload(
             path=storage_path,
             file=f,
-            file_options={
-                "content-type": "application/pdf",
-                "cache-control": "3600",
-                "upsert": "false",
-            },
+            file_options={"content-type": "application/pdf", "cache-control": "3600", "upsert": "false"},
         )
-
     payload = {
         "session_id": sid,
+        "participant_id": pid,
         "file_name": filename,
         "storage_path": storage_path,
-        "mime_type": "application/pdf",
         "file_size_bytes": os.path.getsize(filepath),
-        "report_version": "1.0",
+        "report_version": "2.0",
     }
-    supabase.table("reports").insert(payload).execute()
+    supabase.table("session_reports").insert(payload).execute()
     return storage_path
+
+
+def _progress_state_payload():
+    """Compact resumable state. Analytics stay normalized in student_sessions/student_trades."""
+    keys = [
+        "current_index", "speed", "basket", "positions", "tradebook", "pending_limits",
+        "realized_pnl", "max_reached_index", "data_loaded", "prev_day_close",
+        "start_time", "session_end", "expiry_dt", "scale_factor", "lot_size",
+        "prev_scaled_close", "trading_locked", "session_finished", "current_price",
+        "T_current", "starting_capital", "peak_margin_used", "session_start_wall",
+        "data_source_choice", "day_close_map", "target_nifty_level", "strategy_focus",
+        "equity_peak", "max_drawdown", "max_drawdown_pct", "reflection_note", "session_no",
+    ]
+    state = {}
+    for k in keys:
+        v = st.session_state.get(k)
+        if isinstance(v, (datetime, date, pd.Timestamp)):
+            state[k] = _iso(v)
+        else:
+            try:
+                state[k] = json.loads(json.dumps(v, default=_json_serial))
+            except Exception:
+                pass
+    sim = st.session_state.get("simulated_data")
+    if sim is not None:
+        records = sim.copy()
+        if "datetime" in records.columns:
+            records["datetime"] = records["datetime"].astype(str)
+        state["_sim_records"] = json.loads(records.to_json(orient="records", date_format="iso"))
+    return state
+
+
+def save_progress_snapshot():
+    sid = st.session_state.get("supabase_session_id")
+    pid = st.session_state.get("participant_id")
+    if not supabase_enabled() or not sid or not pid:
+        return
+    payload = {
+        "participant_id": pid,
+        "session_id": sid,
+        "state_json": _progress_state_payload(),
+        "updated_at": datetime.now().isoformat(),
+    }
+    supabase.table("student_progress").upsert(payload, on_conflict="participant_id").execute()
+    try:
+        supabase.table("participants").update({"last_active_at": datetime.now().isoformat()}).eq("id", pid).execute()
+    except Exception:
+        pass
+
+
+def get_active_progress(participant_id):
+    if not supabase_enabled() or not participant_id:
+        return None
+    resp = (
+        supabase.table("student_progress")
+        .select("participant_id,session_id,state_json,updated_at")
+        .eq("participant_id", participant_id)
+        .limit(1)
+        .execute()
+    )
+    rows = _sb_data(resp)
+    return rows[0] if rows else None
+
+
+def restore_progress_snapshot(progress):
+    if not progress:
+        return False
+    state = dict(progress.get("state_json") or {})
+    recs = state.pop("_sim_records", None)
+    if recs:
+        df = pd.DataFrame(recs)
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"])
+        st.session_state.simulated_data = df
+        st.session_state.df_day_scaled = df
+        st.session_state.df_raw = df
+    for k, v in state.items():
+        if k in ("start_time", "session_end", "expiry_dt", "session_start_wall") and v:
+            try:
+                v = datetime.fromisoformat(str(v))
+            except Exception:
+                pass
+        st.session_state[k] = v
+    st.session_state.supabase_session_id = progress.get("session_id")
+    st.session_state.playing = False  # resume paused, never unexpectedly live
+    return True
+
+
+def delete_progress_snapshot():
+    pid = st.session_state.get("participant_id")
+    if supabase_enabled() and pid:
+        try:
+            supabase.table("student_progress").delete().eq("participant_id", pid).execute()
+        except Exception:
+            pass
+
+
+def get_student_history(participant_id, limit=20):
+    if not supabase_enabled() or not participant_id:
+        return []
+    resp = (
+        supabase.table("student_sessions")
+        .select("session_no,started_at,ended_at,status,strategy_focus,total_trades,total_pnl,return_pct,max_drawdown_pct,win_rate_pct,profit_factor")
+        .eq("participant_id", participant_id)
+        .order("session_no", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return _sb_data(resp)
+
+
+def get_student_trades(participant_id, limit=200):
+    if not supabase_enabled() or not participant_id:
+        return []
+    resp = (
+        supabase.table("trade_analysis_export")
+        .select("*")
+        .eq("participant_id", participant_id)
+        .order("entry_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return _sb_data(resp)
+
+
+def get_leaderboard():
+    if not supabase_enabled():
+        return []
+    try:
+        return _sb_data(supabase.table("leaderboard_top5").select("*").execute())
+    except Exception:
+        return []
 
 # ==========================================================
 # END SUPABASE PERSISTENCE LAYER
@@ -821,6 +1060,93 @@ div[data-testid="stMetricValue"] {
 .glossary-term:focus .glossary-tip {
     display: block;
 }
+
+/* Inline basket-leg editor */
+.edit-leg-box {
+    background: #fffdf5;
+    border: 1px solid #f0e2a8;
+    border-radius: 8px;
+    padding: 10px 12px 4px 12px;
+    margin: -2px 0 8px 0;
+}
+
+/* ===== UI refinement: restrained academic trading terminal ===== */
+html, body, [class*="css"] { font-family: Inter, "Segoe UI", Arial, sans-serif; }
+.stApp { color: #17202a !important; }
+.main .block-container { max-width: 1440px !important; padding-left: 18px !important; padding-right: 18px !important; }
+.fixed-header { min-height: 48px; padding: 9px 20px; border-radius: 0; box-shadow: 0 1px 4px rgba(10,37,64,0.16); }
+.fixed-header h1 { font-size: 16px; letter-spacing: 0.1px; }
+.fixed-header p { font-size: 11px; color: #c7d8e8; }
+.card, .card-beige, .order-card, .strategy-card, .preview-box, .margin-box { border-radius: 8px; box-shadow: none; }
+.card { border-color: #dfe5eb; }
+.card-beige { background: #fbfaf7; }
+.stButton > button { border-radius: 6px !important; min-height: 38px; box-shadow: none !important; letter-spacing: 0; }
+.stButton > button:hover { transform: none; box-shadow: none !important; }
+.stTabs [data-baseweb="tab-list"] { border-radius: 6px; padding: 3px; }
+.stTabs [data-baseweb="tab"] { border-radius: 4px; }
+.section-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.45px; color: #34495e; margin-top: 16px; }
+.subsection-title { color: #425466; }
+.hint-line, .strategy-note, .preview-hint { color: #657786; }
+.disclaimer-banner { background: #fff7ed; color: #7c4a03; border: 1px solid #efd8b4; border-left: 3px solid #c98a2e; border-radius: 5px; text-align: left; font-weight: 500; padding: 7px 12px; }
+div[data-testid="stTextInput"] label, div[data-testid="stNumberInput"] label, div[data-testid="stSelectbox"] label, div[data-testid="stSlider"] label, div[data-testid="stCheckbox"] label, div[data-testid="stFileUploader"] label {
+    color: #263645 !important; font-weight: 600 !important;
+}
+/* Force Streamlit/BaseWeb text inputs into a readable light theme, including browser autofill. */
+div[data-testid="stTextInput"] [data-baseweb="input"],
+div[data-testid="stNumberInput"] [data-baseweb="input"] {
+    background: #ffffff !important;
+    border: 1px solid #b9c5d1 !important;
+    border-radius: 6px !important;
+    box-shadow: none !important;
+}
+div[data-testid="stTextInput"] input,
+div[data-testid="stNumberInput"] input {
+    background: #ffffff !important;
+    color: #17202a !important;
+    caret-color: #17202a !important;
+    -webkit-text-fill-color: #17202a !important;
+    opacity: 1 !important;
+    border: 0 !important;
+    border-radius: 6px !important;
+}
+div[data-testid="stTextInput"] input::placeholder,
+div[data-testid="stNumberInput"] input::placeholder {
+    color: #8a98a6 !important;
+    -webkit-text-fill-color: #8a98a6 !important;
+    opacity: 1 !important;
+}
+div[data-testid="stTextInput"] input:-webkit-autofill,
+div[data-testid="stTextInput"] input:-webkit-autofill:hover,
+div[data-testid="stTextInput"] input:-webkit-autofill:focus,
+div[data-testid="stNumberInput"] input:-webkit-autofill,
+div[data-testid="stNumberInput"] input:-webkit-autofill:hover,
+div[data-testid="stNumberInput"] input:-webkit-autofill:focus {
+    -webkit-box-shadow: 0 0 0 1000px #ffffff inset !important;
+    box-shadow: 0 0 0 1000px #ffffff inset !important;
+    -webkit-text-fill-color: #17202a !important;
+    caret-color: #17202a !important;
+    transition: background-color 9999s ease-out 0s;
+}
+div[data-testid="stTextInput"] [data-baseweb="input"]:focus-within,
+div[data-testid="stNumberInput"] [data-baseweb="input"]:focus-within {
+    border-color: #387ed1 !important;
+    box-shadow: 0 0 0 1px #387ed1 !important;
+}
+div[data-testid="stForm"] { max-width: 720px; margin: 8px auto 24px auto; padding: 24px 26px 20px 26px; background: #ffffff; border: 1px solid #dfe5eb; border-radius: 9px; box-shadow: 0 8px 24px rgba(10,37,64,0.06); }
+.identity-title { max-width: 720px; margin: 20px auto 2px auto; font-size: 22px; font-weight: 700; color: #0a2540; }
+.identity-subtitle { max-width: 720px; margin: 0 auto 12px auto; font-size: 13px; color: #5e6c78; line-height: 1.55; }
+div[data-testid="stForm"] div[data-testid="stMarkdownContainer"] p { color: #34495e !important; }
+div[data-testid="stForm"] [data-testid="stCheckbox"] p { color: #34495e !important; }
+div[data-testid="stFormSubmitButton"] button {
+    background: #0a2540 !important;
+    color: #ffffff !important;
+    border: 1px solid #0a2540 !important;
+    font-weight: 650 !important;
+}
+div[data-testid="stFormSubmitButton"] button p,
+div[data-testid="stFormSubmitButton"] button span { color: #ffffff !important; }
+div[data-testid="stFormSubmitButton"] button:hover { background: #123a60 !important; border-color: #123a60 !important; }
+
 </style>
 """
 
@@ -866,6 +1192,17 @@ defaults = {
     'report_generated': False,
     'report_path': None,
     'df_raw': None,
+    'participant_id': None,
+    'student_name': '',
+    'student_id': '',
+    'student_email': '',
+    'supabase_session_id': None,
+    'session_no': None,
+    'strategy_focus': 'Open practice',
+    'reflection_note': '',
+    'equity_peak': 10000000.0,
+    'max_drawdown': 0.0,
+    'max_drawdown_pct': 0.0,
     'df_day_scaled': None,
     'current_price': DEFAULT_OPEN_PRICE,
     'T_current': TOTAL_EXPIRY_DAYS / 365,
@@ -875,11 +1212,7 @@ defaults = {
     'session_start_wall': None,
     'data_source_choice': None,   # 'upload' | 'path' | 'garch'
     'day_close_map': {},          # day_num -> previous day's close for change calc
-    'participant_id': None,
-    'student_name': '',
-    'student_id': '',
-    'student_email': '',
-    'supabase_session_id': None,
+    'editing_basket_idx': None,   # index of the basket leg currently being edited inline, if any
 }
 
 for k, v in defaults.items():
@@ -1586,12 +1919,12 @@ def _json_serial(obj):
 
 
 def save_session_state():
-    """Persist locally only when Supabase is unavailable.
-
-    A single filesystem JSON on Streamlit Community Cloud would be shared across users,
-    so it is intentionally disabled when the cloud database is configured.
-    """
+    """Persist to Supabase progress when available; local JSON is fallback-only."""
     if supabase_enabled():
+        try:
+            save_progress_snapshot()
+        except Exception:
+            pass
         return
     keys = [
         'current_index', 'playing', 'speed', 'basket', 'positions', 'tradebook',
@@ -1744,8 +2077,15 @@ def generate_pdf_report():
     pdf.cell(0, 10, "Option Market Simulator - Performance Report", ln=True, align="C")
     pdf.ln(8)
     pdf.set_font("Arial", "", 11)
-    pdf.cell(0, 8, f"Date: {date.today().strftime('%d-%m-%Y')}", ln=True)
-    pdf.cell(0, 8, f"Total Trades: {len(st.session_state.tradebook)}", ln=True)
+    student_name = str(st.session_state.get("student_name") or "-")
+    student_id = str(st.session_state.get("student_id") or "-")
+    pdf.cell(0, 7, f"Student Name: {student_name}", ln=True)
+    pdf.cell(0, 7, f"Student ID / Roll No.: {student_id}", ln=True)
+    pdf.cell(0, 7, f"Date: {date.today().strftime('%d-%m-%Y')}", ln=True)
+    pdf.cell(0, 7, f"App Version: {APP_VERSION}", ln=True)
+    pdf.cell(0, 7, f"Session No.: {st.session_state.get('session_no') or '-'}", ln=True)
+    pdf.cell(0, 7, f"Learning Focus: {st.session_state.get('strategy_focus') or 'Open practice'}", ln=True)
+    pdf.cell(0, 7, f"Total Trades: {len(st.session_state.tradebook)}", ln=True)
     pdf.ln(4)
     closed_pnl = sum(t['pnl'] for t in st.session_state.tradebook if t['status'] == 'Closed')
     open_pnl = 0.0
@@ -1758,7 +2098,11 @@ def generate_pdf_report():
     pdf.set_font("Arial", "", 11)
     pdf.cell(0, 7, f"Realized P&L: {closed_pnl:+.2f}", ln=True)
     pdf.cell(0, 7, f"Open P&L: {open_pnl:+.2f}", ln=True)
-    pdf.cell(0, 7, f"Total P&L: {closed_pnl + open_pnl:+.2f}", ln=True)
+    total_pdf_pnl = closed_pnl + open_pnl
+    starting_pdf = float(st.session_state.get("starting_capital", 10000000.0))
+    pdf.cell(0, 7, f"Total P&L: {total_pdf_pnl:+.2f}", ln=True)
+    pdf.cell(0, 7, f"Return: {(total_pdf_pnl / starting_pdf * 100.0) if starting_pdf else 0.0:+.2f}%", ln=True)
+    pdf.cell(0, 7, f"Maximum Drawdown: {float(st.session_state.get('max_drawdown', 0.0)):.2f} ({float(st.session_state.get('max_drawdown_pct', 0.0)):.2f}%)", ln=True)
     pdf.ln(4)
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 8, "Tradebook", ln=True)
@@ -1817,7 +2161,10 @@ def _settle_all_cash(spot, current_dt):
         return
     realized_add = 0.0
     for pos in list(st.session_state.positions):
-        intrinsic = max(spot - pos['strike'], 0.0) if pos['type'] == 'CE' else max(pos['strike'] - spot, 0.0)
+        if pos['type'] == 'FUT':
+            intrinsic = float(spot)
+        else:
+            intrinsic = max(spot - pos['strike'], 0.0) if pos['type'] == 'CE' else max(pos['strike'] - spot, 0.0)
         for t in st.session_state.tradebook:
             if (t['strike'] == pos['strike'] and t['type'] == pos['type']
                     and t['status'] == 'Open' and t['side'] == pos['side']):
@@ -1890,7 +2237,7 @@ def match_pending_limits(current_price, current_dt, chain_df, lot_size):
                         item, "filled", current_dt=current_dt,
                         current_price=current_price, fill_price=item['price']
                     )
-                trade_id = save_trade_record(item, current_dt, order_id)
+                trade_id = save_trade_record(item, current_dt, order_id, current_price=current_price)
             except Exception:
                 pass
 
@@ -1902,6 +2249,13 @@ def match_pending_limits(current_price, current_dt, chain_df, lot_size):
             'qty': item['quantity'],
             'lots': item['lots'],
             'entry_price': item['price'],
+            'entry_dt': _iso(current_dt),
+            'strategy_name': _strategy_label(item),
+            'capital_used': _estimate_trade_capital(item, current_price),
+            'max_drawdown': 0.0,
+            'max_drawdown_pct': 0.0,
+            'max_profit_seen': 0.0,
+            'holding_minutes': 0.0,
             'exit_time': '-',
             'exit_price': 0.0,
             'pnl': 0.0,
@@ -1934,66 +2288,92 @@ def main():
     # Fixed Header
     st.markdown("""
     <div class="fixed-header">
-        <h1>Option Market Simulator (Live Trading Simulator)</h1>
-        <p>Developed by Prof. Bhavesh (IMNU) · classroom teaching tool</p>
+        <h1>NIFTY Options Trading Simulator</h1>
+        <p>DRM IMBA 2026 · Academic simulation environment</p>
     </div>
     """, unsafe_allow_html=True)
 
     # Persistent disclaimer — required to stay visible on every screen (Section 4.1 of guidelines)
     st.markdown("""
     <div class="disclaimer-banner">
-        ⚠️ Developed for classroom use only — not for commercial or live trading use.
-        Prices, margin, and P&amp;L are simulated for learning purposes and do not reflect a
-        real broker, exchange, or live market.
+        Academic simulation only. Not intended for commercial or live trading use. Prices, margin and P&amp;L are simulated and do not represent a broker, exchange or live market.
     </div>
     """, unsafe_allow_html=True)
 
     # ===== STUDENT IDENTIFICATION / CLOUD SESSION OWNERSHIP =====
     if supabase_enabled() and not st.session_state.get("participant_id"):
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("### Student Identification")
-        st.caption(
-            "Your simulator session, orders, trades, performance summary and final report "
-            "will be recorded for academic/classroom use."
-        )
+        st.markdown('<div class="card identity-shell">', unsafe_allow_html=True)
+        st.markdown("""
+        <div class="identity-title">Student Access</div>
+        <div class="identity-subtitle">
+            Use your Student ID each time you return. Existing students automatically recover their stored profile,
+            completed-session history and any unfinished simulator session.
+        </div>
+        """, unsafe_allow_html=True)
         with st.form("student_identity_form", clear_on_submit=False):
-            student_name = st.text_input("Full name *", value=st.session_state.get("student_name", ""))
-            student_id = st.text_input("Student ID *", value=st.session_state.get("student_id", ""))
+            student_id = st.text_input("Student ID / Roll No. *", value=st.session_state.get("student_id", ""))
             student_email = st.text_input("Email (optional)", value=st.session_state.get("student_email", ""))
-            consent = st.checkbox(
-                "I understand that my simulator activity will be stored for classroom/academic review."
+            student_name = st.text_input(
+                "Full Name (required only on first visit)",
+                value=st.session_state.get("student_name", ""),
+                help="Returning students are recognised by Student ID and their stored name is retrieved automatically."
             )
-            submitted = st.form_submit_button("Continue to Simulator", type="primary", use_container_width=True)
+            consent = st.checkbox(
+                "I understand that my trading activity and performance will be recorded for academic evaluation."
+            )
+            submitted = st.form_submit_button("Enter Simulator", type="primary", use_container_width=True)
 
         if submitted:
-            if not student_name.strip() or not student_id.strip():
-                st.error("Please enter both your full name and Student ID.")
+            db_ok, db_error = test_supabase_connection()
+            if not db_ok:
+                print(f"[Supabase] Student access blocked: {db_error}")
+                st.error(
+                    "Cloud student records are temporarily unavailable. "
+                    "Please ask the administrator to verify the Supabase Project URL and API key in Streamlit Secrets."
+                )
+                return
+            if not student_id.strip():
+                st.error("Please enter your Student ID.")
             elif student_email.strip() and "@" not in student_email:
                 st.error("Please enter a valid email address or leave the email field blank.")
             elif not consent:
-                st.error("Please confirm the session-recording notice to continue.")
+                st.error("Please confirm the academic-recording notice to continue.")
             else:
                 try:
-                    pid = create_or_get_participant(student_name, student_id, student_email)
-                    if not pid:
-                        raise RuntimeError("Supabase did not return a participant ID.")
-                    st.session_state.participant_id = pid
-                    st.session_state.student_name = student_name.strip()
-                    st.session_state.student_id = student_id.strip()
-                    st.session_state.student_email = student_email.strip().lower()
+                    existing_profile = get_participant_by_student_id(student_id)
+                    if not existing_profile and not student_name.strip():
+                        st.error("First-time users must enter their full name.")
+                        return
+                    profile = create_or_get_participant(
+                        student_name or (existing_profile or {}).get("student_name", ""),
+                        student_id,
+                        student_email
+                    )
+                    if not profile:
+                        raise RuntimeError("Supabase did not return a participant profile.")
+                    st.session_state.participant_id = profile["id"]
+                    # For a returning roll number, the stored profile becomes the canonical identity.
+                    st.session_state.student_name = str(profile.get("student_name") or student_name).strip()
+                    st.session_state.student_id = str(profile.get("student_id") or student_id).strip()
+                    st.session_state.student_email = str(profile.get("email") or student_email or "").strip().lower()
+
+                    progress = get_active_progress(profile["id"])
+                    if progress:
+                        restore_progress_snapshot(progress)
+                        st.session_state._resume_notice = True
                     st.rerun()
-                except Exception as exc:
-                    st.error(f"Could not register the student in Supabase: {exc}")
+                except Exception:
+                    st.error("Could not access your stored student profile. Please verify the Student ID and try again.")
         st.markdown('</div>', unsafe_allow_html=True)
         return
     elif not supabase_enabled():
         st.warning(
-            "Cloud session logging is currently unavailable because Supabase credentials "
-            "could not be loaded. The simulator can still run locally, but this session "
-            "will not be stored centrally."
+            "Cloud progress is unavailable because Supabase credentials could not be loaded. "
+            "The simulator will work, but this run will not be retained centrally."
         )
 
-    lot_size = st.session_state.lot_size
+    if st.session_state.pop("_resume_notice", False):
+        st.success("Previous unfinished session restored. The market is paused so you can review before continuing.")
 
     # ===== DATA SOURCE SETUP =====
     if not st.session_state.data_loaded:
@@ -2004,6 +2384,20 @@ def main():
             "GARCH(1,1) model (annualized vol 12%-18%). Optionally supply your own intraday "
             "data below -- either input overrides the default model."
         )
+
+        prior_sessions = get_student_history(st.session_state.get("participant_id"), limit=10) if supabase_enabled() else []
+        prior_completed = [x for x in prior_sessions if x.get("status") == "completed"]
+        if prior_completed:
+            with st.expander(f"Previous performance · {len(prior_completed)} completed session(s)", expanded=False):
+                prev_df = pd.DataFrame(prior_completed)
+                cols = [c for c in ["session_no", "strategy_focus", "total_trades", "total_pnl", "return_pct", "max_drawdown_pct", "win_rate_pct", "profit_factor"] if c in prev_df.columns]
+                prev_df = prev_df[cols].rename(columns={
+                    "session_no": "Session", "strategy_focus": "Learning Focus", "total_trades": "Trades",
+                    "total_pnl": "P&L (₹)", "return_pct": "Return %", "max_drawdown_pct": "Max DD %",
+                    "win_rate_pct": "Win Rate %", "profit_factor": "Profit Factor"
+                })
+                st.dataframe(prev_df, use_container_width=True, hide_index=True)
+                st.caption("Your detailed executed-trade history remains available in Performance & Progress after a session starts or is resumed.")
         st.markdown("""
         <div class="empty-box" style="text-align:left; border-style:solid; margin-top:4px;">
             <b>In this session you will:</b> watch the NIFTY path move bar by bar, place a call/put
@@ -2017,9 +2411,50 @@ def main():
                                        placeholder="/path/to/your/data.txt")
         with c2:
             uploaded = st.file_uploader("Or upload data file (optional)", type=["txt", "csv"], key="setup_upload")
-        open_price_input = st.number_input("Opening price", min_value=1.0, value=DEFAULT_OPEN_PRICE, step=50.0, key="setup_open")
+
+        c3, c4, c5 = st.columns(3)
+        with c3:
+            open_price_input = st.number_input("Opening price", min_value=1.0, value=DEFAULT_OPEN_PRICE, step=50.0, key="setup_open")
+        with c4:
+            capital_input = st.number_input(
+                "Starting capital (₹)", min_value=100000.0, value=float(st.session_state.get('starting_capital', 10000000.0)),
+                step=100000.0, format="%.0f", key="setup_capital",
+                help="Lower this to make margin limits actually bite during the session — the ₹1 Cr default rarely runs out."
+            )
+        with c5:
+            lot_size_input = st.number_input(
+                "Lot size", min_value=1, value=int(st.session_state.get('lot_size', 65)),
+                step=5, key="setup_lot_size",
+                help="Contract multiplier per lot. NIFTY's exchange-set lot size has varied historically; 65 mirrors a recent value."
+            )
+        st.caption(
+            f"With ₹{capital_input:,.0f} capital and a {lot_size_input}-unit lot, a single naked short option "
+            f"typically consumes materially more margin than a long premium position. Use the capital setting "
+            f"to make risk limits meaningful for the exercise."
+        )
+
+        strategy_focus = st.selectbox(
+            "Session learning focus",
+            [
+                "Open practice",
+                "Directional options",
+                "Vertical spreads",
+                "Volatility strategies",
+                "Hedging / protection",
+                "Risk and margin discipline",
+            ],
+            index=0,
+            key="setup_strategy_focus",
+            help="Used only for progress tracking; it does not constrain which trades you can place."
+        )
 
         if st.button("Start Session", type="primary", use_container_width=True, key="btn_start_session"):
+            st.session_state.starting_capital = float(capital_input)
+            st.session_state.lot_size = int(lot_size_input)
+            st.session_state.strategy_focus = strategy_focus
+            st.session_state.equity_peak = float(capital_input)
+            st.session_state.max_drawdown = 0.0
+            st.session_state.max_drawdown_pct = 0.0
             df = None
             source = "garch"
             user_supplied_but_failed = False
@@ -2195,6 +2630,10 @@ def main():
         st.session_state.peak_margin_used = used_margin
     available_margin = max(0.0, st.session_state.starting_capital - used_margin)
 
+    # Learning analytics: update trade MAE/max-profit and portfolio drawdown every visible bar.
+    update_live_risk_metrics(current_price, current_dt, chain_df)
+    update_session_drawdown(open_pnl)
+
     # ===== LAYOUT: LEFT + RIGHT =====
     col_left, col_right = st.columns([1, 2], gap="medium")
 
@@ -2205,7 +2644,7 @@ def main():
         if st.session_state.trading_locked or st.session_state.current_index >= n_bars - 1:
             _day_extra = " &nbsp;·&nbsp; <span style='color:#ffab40'>SESSION CLOSED</span>"
         st.markdown(f"""
-        <div style="background:linear-gradient(90deg,#0a1628,#12263a);color:#e8f0fe;border-radius:10px;padding:8px 14px;margin-bottom:10px;
+        <div style="background:#0a2540;color:#e8f0fe;border-radius:10px;padding:8px 14px;margin-bottom:10px;
                     text-align:center;font-weight:700;font-size:15px;letter-spacing:0.3px;border:1px solid #1e3a5f;">
             TRADING DAY &nbsp;·&nbsp; Day-{current_day_num}{_day_extra}
         </div>
@@ -2279,13 +2718,13 @@ def main():
             }
             </style>
             """, unsafe_allow_html=True)
-            if st.button("▶  GO LIVE", use_container_width=True, type="primary", key="btn_golive",
+            if st.button("GO LIVE", use_container_width=True, type="primary", key="btn_golive",
                          disabled=st.session_state.trading_locked):
                 st.session_state.playing = True
                 st.session_state.last_update = time.time()
                 st.rerun()
         else:
-            if st.button("⏸  PAUSE", use_container_width=True, key="btn_pause"):
+            if st.button("PAUSE", use_container_width=True, key="btn_pause"):
                 st.session_state.playing = False
                 save_session_state()
                 st.rerun()
@@ -2330,7 +2769,7 @@ def main():
 
         # Reset high-contrast
         st.markdown('<div class="reset-btn-container">', unsafe_allow_html=True)
-        if st.button("🔄 RESET SESSION", use_container_width=True, key="btn_reset"):
+        if st.button("RESET SESSION", use_container_width=True, key="btn_reset"):
             # Close the current database session as a reset/abandoned run before starting a fresh one.
             if supabase_enabled() and st.session_state.get("supabase_session_id"):
                 try:
@@ -2382,8 +2821,8 @@ def main():
 
     # ==================== RIGHT PANEL ====================
     with col_right:
-        tab_place, tab_pos, tab_graph, tab_perf = st.tabs([
-            "Place Order", "Positions", "View Graph", "Performance and Reports"
+        tab_place, tab_pos, tab_graph, tab_perf, tab_leaderboard = st.tabs([
+            "Place Order", "Positions", "Market Chart", "Performance & Progress", "Leaderboard"
         ])
 
         # ---------- TAB 1: PLACE ORDER ----------
@@ -2481,7 +2920,7 @@ def main():
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander("📈 Show payoff diagram for this order"):
+            with st.expander("View payoff diagram for this order"):
                 fig_leg, _ = render_payoff_diagram(_trial_items, current_price, title=f"{side} {strike} {otype} — Payoff at Expiry")
                 st.plotly_chart(fig_leg, use_container_width=True, config={'displayModeBar': False})
 
@@ -2563,7 +3002,7 @@ def main():
                                 item, "filled", current_dt=current_dt,
                                 current_price=current_price, fill_price=item['price']
                             )
-                            trade_id = save_trade_record(item, current_dt, order_id)
+                            trade_id = save_trade_record(item, current_dt, order_id, current_price=current_price)
                         except Exception:
                             pass
 
@@ -2583,6 +3022,13 @@ def main():
                         'qty': item['quantity'],
                         'lots': item['lots'],
                         'entry_price': item['price'],
+                        'entry_dt': _iso(current_dt),
+                        'strategy_name': _strategy_label(item),
+                        'capital_used': _estimate_trade_capital(item, current_price),
+                        'max_drawdown': 0.0,
+                        'max_drawdown_pct': 0.0,
+                        'max_profit_seen': 0.0,
+                        'holding_minutes': 0.0,
                         'exit_time': '-',
                         'exit_price': 0.0,
                         'pnl': 0.0,
@@ -2714,7 +3160,7 @@ def main():
                 </div>
             </div>
             """, unsafe_allow_html=True)
-            with st.expander("📈 Show payoff diagram for this strategy"):
+            with st.expander("View payoff diagram for this strategy"):
                 fig_strat, _ = render_payoff_diagram(strat_items, current_price, title=f"{strat_name.split('(')[0].strip()} — Payoff at Expiry")
                 st.plotly_chart(fig_strat, use_container_width=True, config={'displayModeBar': False})
             if uses_fut:
@@ -2726,7 +3172,7 @@ def main():
                 unsafe_allow_html=True
             )
 
-            if st.button("➕ Add Strategy to Basket", key="btn_add_strategy", type="secondary",
+            if st.button("Add Strategy to Basket", key="btn_add_strategy", type="secondary",
                          use_container_width=True, disabled=st.session_state.trading_locked):
                 group_id = str(uuid.uuid4())
                 for strategy_item in strat_items:
@@ -2742,7 +3188,7 @@ def main():
             st.markdown('<div class="section-title">Basket <span style="font-weight:500;color:#888;font-size:11px;">— add multiple legs, then execute together</span></div>', unsafe_allow_html=True)
             if st.session_state.basket:
                 for i, item in enumerate(st.session_state.basket):
-                    cols = st.columns([5, 1])
+                    cols = st.columns([4.3, 0.7, 0.7])
                     with cols[0]:
                         side_cls = "item-side-buy" if item['side'] == 'Buy' else "item-side-sell"
                         st.markdown(
@@ -2756,9 +3202,48 @@ def main():
                             unsafe_allow_html=True
                         )
                     with cols[1]:
-                        if st.button("✕", key=f"rm_basket_{i}"):
-                            del st.session_state.basket[i]
+                        if st.button("✏️", key=f"edit_basket_{i}", help="Edit this leg"):
+                            st.session_state.editing_basket_idx = None if st.session_state.editing_basket_idx == i else i
                             st.rerun()
+                    with cols[2]:
+                        if st.button("✕", key=f"rm_basket_{i}", help="Remove this leg"):
+                            del st.session_state.basket[i]
+                            if st.session_state.editing_basket_idx == i:
+                                st.session_state.editing_basket_idx = None
+                            st.rerun()
+
+                    if st.session_state.editing_basket_idx == i:
+                        st.markdown('<div class="edit-leg-box">', unsafe_allow_html=True)
+                        ec1, ec2 = st.columns(2)
+                        with ec1:
+                            new_lots = st.number_input(
+                                "Lots", min_value=1, value=int(item['lots']), step=1, key=f"edit_lots_{i}"
+                            )
+                        with ec2:
+                            if item['type'] != 'FUT':
+                                new_price = st.number_input(
+                                    "Price (₹)", min_value=0.05, value=float(item['price']), step=0.05, key=f"edit_price_{i}"
+                                )
+                                st.caption("Saving a changed price turns this into a LIMIT leg at that price.")
+                            else:
+                                new_price = item['price']
+                                st.caption("The underlying leg marks to live spot — price isn't editable here.")
+                        esave, ecancel = st.columns(2)
+                        with esave:
+                            if st.button("Save Changes", key=f"save_edit_{i}", type="primary", use_container_width=True):
+                                st.session_state.basket[i]['lots'] = int(new_lots)
+                                st.session_state.basket[i]['quantity'] = int(new_lots) * lot_size
+                                if item['type'] != 'FUT' and float(new_price) != float(item['price']):
+                                    st.session_state.basket[i]['price'] = float(new_price)
+                                    st.session_state.basket[i]['order_type'] = 'LIMIT'
+                                st.session_state.editing_basket_idx = None
+                                st.toast("Leg updated", icon="✏️")
+                                st.rerun()
+                        with ecancel:
+                            if st.button("Cancel", key=f"cancel_edit_{i}", use_container_width=True):
+                                st.session_state.editing_basket_idx = None
+                                st.rerun()
+                        st.markdown('</div>', unsafe_allow_html=True)
 
                 margin_req = calculate_realistic_margin(
                     list(st.session_state.positions) + list(st.session_state.basket),
@@ -2791,7 +3276,7 @@ def main():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                with st.expander("📈 Show combined payoff diagram for the whole basket", expanded=False):
+                with st.expander("View combined payoff diagram", expanded=False):
                     fig_basket, _ = render_payoff_diagram(st.session_state.basket, current_price, title="Basket — Combined Payoff at Expiry")
                     st.plotly_chart(fig_basket, use_container_width=True, config={'displayModeBar': False})
 
@@ -2824,7 +3309,7 @@ def main():
                         st.rerun()
             else:
                 st.markdown(
-                    '<div class="empty-box">🧺 Basket is empty. Build multi-leg orders (e.g. a spread) '
+                    '<div class="empty-box">Basket is empty. Build multi-leg orders (e.g. a spread) '
                     'by choosing an option above and clicking <b>Add to Basket</b> for each leg, '
                     'then execute them together.</div>',
                     unsafe_allow_html=True
@@ -2862,7 +3347,7 @@ def main():
                             st.rerun()
             else:
                 st.markdown(
-                    '<div class="empty-box">📋 No pending limit orders. A limit order waits here until '
+                    '<div class="empty-box">No pending limit orders. A limit order waits here until '
                     'the market price reaches your price.</div>',
                     unsafe_allow_html=True
                 )
@@ -3046,40 +3531,108 @@ def main():
 
         # ---------- TAB 4: PERFORMANCE AND REPORTS ----------
         with tab_perf:
-            st.markdown('<div class="section-title">Session Summary</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Current Session</div>', unsafe_allow_html=True)
             total_trades = len(st.session_state.tradebook)
             closed_trades = [t for t in st.session_state.tradebook if t['status'] == 'Closed']
             wins = len([t for t in closed_trades if t['pnl'] > 0])
             win_rate = (wins / len(closed_trades) * 100) if closed_trades else 0.0
+            total_now = float(open_pnl + realized_pnl)
+            session_return = (total_now / st.session_state.starting_capital * 100.0) if st.session_state.starting_capital else 0.0
 
             m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Trading Day", f"Day-{current_day_num}")
-            m2.metric("Total Trades", total_trades)
-            m3.metric("Closed Trades", len(closed_trades))
-            m4.metric("Win Rate", f"{win_rate:.0f}%")
+            m1.metric("Session", f"#{st.session_state.get('session_no') or '—'}")
+            m2.metric("Trades", total_trades)
+            m3.metric("Win Rate", f"{win_rate:.1f}%")
+            m4.metric("Return", f"{session_return:+.2f}%")
 
-            st.markdown('<div class="section-title">P&L Snapshot</div>', unsafe_allow_html=True)
-            p1, p2, p3 = st.columns(3)
-            p1.metric("Open P&L", f"₹{open_pnl:+,.2f}")
-            p2.metric("Realized P&L", f"₹{realized_pnl:+,.2f}")
-            p3.metric("Total P&L", f"₹{open_pnl + realized_pnl:+,.2f}")
-
-            # Profit vs Funds Utilized
+            p1, p2, p3, p4 = st.columns(4)
+            p1.metric("Total P&L", f"₹{total_now:+,.0f}")
+            p2.metric("Max Drawdown", f"₹{st.session_state.get('max_drawdown', 0.0):,.0f}")
+            p3.metric("Max Drawdown %", f"{st.session_state.get('max_drawdown_pct', 0.0):.2f}%")
             peak_m = max(st.session_state.peak_margin_used, 1)
-            capital_eff = ((open_pnl + realized_pnl) / peak_m) * 100
-            st.markdown('<div class="section-title">Performance vs Capital</div>', unsafe_allow_html=True)
-            e1, e2, e3 = st.columns(3)
-            e1.metric("Peak Margin Used", f"₹{st.session_state.peak_margin_used:,.0f}")
-            e2.metric("Starting Capital", f"₹{st.session_state.starting_capital:,.0f}")
-            e3.metric("Return on Margin", f"{capital_eff:+.2f}%")
+            capital_eff = total_now / peak_m * 100.0
+            p4.metric("Return on Margin", f"{capital_eff:+.2f}%")
 
-            # Tradebook
-            st.markdown('<div class="section-title">Tradebook</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-title">Executed Trades</div>', unsafe_allow_html=True)
             if st.session_state.tradebook:
-                tb_df = pd.DataFrame(st.session_state.tradebook)
-                st.dataframe(tb_df, use_container_width=True, hide_index=True, height=240)
+                rows = []
+                for i, t in enumerate(st.session_state.tradebook, start=1):
+                    capital = max(float(t.get('capital_used', 0.0) or 0.0), 1.0)
+                    rows.append({
+                        "#": i,
+                        "Strategy": t.get('strategy_name', 'Manual trade'),
+                        "Instrument": instrument_label(t.get('strike', 0), t.get('type')),
+                        "Side": t.get('side'),
+                        "Qty": t.get('qty'),
+                        "Entry": t.get('entry_price'),
+                        "Exit": t.get('exit_price') if t.get('status') == 'Closed' else None,
+                        "P&L (₹)": t.get('pnl', 0.0),
+                        "Return %": float(t.get('pnl', 0.0)) / capital * 100.0 if t.get('status') == 'Closed' else None,
+                        "Max DD %": t.get('max_drawdown_pct', 0.0),
+                        "Holding (min)": round(float(t.get('holding_minutes', 0.0) or 0.0), 1),
+                        "Status": t.get('status'),
+                    })
+                tb_view = pd.DataFrame(rows)
+                st.dataframe(
+                    tb_view,
+                    use_container_width=True,
+                    hide_index=True,
+                    height=min(330, 42 + 36 * len(tb_view)),
+                    column_config={
+                        "Entry": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Exit": st.column_config.NumberColumn(format="₹%.2f"),
+                        "P&L (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                        "Return %": st.column_config.NumberColumn(format="%.2f%%"),
+                        "Max DD %": st.column_config.NumberColumn(format="%.2f%%"),
+                    },
+                )
             else:
-                st.caption("No trades yet")
+                st.caption("No executed trades yet.")
+
+            # Longitudinal learning dashboard for this student.
+            st.markdown('<div class="section-title">My Progress</div>', unsafe_allow_html=True)
+            history = get_student_history(st.session_state.get('participant_id')) if supabase_enabled() else []
+            completed_history = [h for h in history if h.get('status') == 'completed']
+            if completed_history:
+                cum_pnl = sum(float(h.get('total_pnl') or 0.0) for h in completed_history)
+                hist_trades = sum(int(h.get('total_trades') or 0) for h in completed_history)
+                best_session = max(float(h.get('total_pnl') or 0.0) for h in completed_history)
+                worst_dd = max(float(h.get('max_drawdown_pct') or 0.0) for h in completed_history)
+                h1, h2, h3, h4 = st.columns(4)
+                h1.metric("Completed Sessions", len(completed_history))
+                h2.metric("Historical Trades", hist_trades)
+                h3.metric("Cumulative P&L", f"₹{cum_pnl:+,.0f}")
+                h4.metric("Worst Drawdown", f"{worst_dd:.2f}%")
+
+                hist_df = pd.DataFrame(completed_history)
+                display_cols = [c for c in ["session_no", "strategy_focus", "total_trades", "total_pnl", "return_pct", "max_drawdown_pct", "win_rate_pct", "profit_factor"] if c in hist_df.columns]
+                hist_df = hist_df[display_cols].rename(columns={
+                    "session_no": "Session",
+                    "strategy_focus": "Learning Focus",
+                    "total_trades": "Trades",
+                    "total_pnl": "P&L (₹)",
+                    "return_pct": "Return %",
+                    "max_drawdown_pct": "Max DD %",
+                    "win_rate_pct": "Win Rate %",
+                    "profit_factor": "Profit Factor",
+                })
+                st.dataframe(hist_df, use_container_width=True, hide_index=True, height=min(280, 42 + 36 * len(hist_df)))
+
+                student_trade_rows = get_student_trades(st.session_state.get('participant_id'), limit=300)
+                if student_trade_rows:
+                    td = pd.DataFrame(student_trade_rows)
+                    if 'strategy_name' in td.columns and 'pnl' in td.columns:
+                        strat = td.groupby('strategy_name', dropna=False).agg(
+                            Trades=('pnl', 'count'),
+                            Net_PnL=('pnl', 'sum'),
+                            Avg_Return=('return_pct', 'mean'),
+                            Avg_Max_DD=('max_drawdown_pct', 'mean')
+                        ).reset_index().sort_values('Net_PnL', ascending=False)
+                        strat = strat.rename(columns={"strategy_name": "Strategy", "Net_PnL": "Net P&L (₹)", "Avg_Return": "Avg Return %", "Avg_Max_DD": "Avg Max DD %"})
+                        with st.expander("Strategy-level progress"):
+                            st.dataframe(strat, use_container_width=True, hide_index=True)
+            else:
+                st.caption("Complete your first session to start building a historical performance record.")
 
             # Net Greeks
             if st.session_state.positions:
@@ -3129,7 +3682,7 @@ def main():
             if _model_pdf:
                 with open(_model_pdf, "rb") as _mf:
                     st.download_button(
-                        "📄 Download Model Specification (PDF)",
+                        "Download Model Specification (PDF)",
                         _mf,
                         file_name="Model_Math.pdf",
                         mime="application/pdf",
@@ -3139,10 +3692,20 @@ def main():
             else:
                 st.caption("Model PDF not found on disk.")
 
+            # Reflection makes the simulator a learning journal, not only a scorecard.
+            st.markdown('<div class="section-title">Session Reflection</div>', unsafe_allow_html=True)
+            st.session_state.reflection_note = st.text_area(
+                "What did you learn from this session? (optional)",
+                value=st.session_state.get("reflection_note", ""),
+                max_chars=800,
+                placeholder="Example: My directional view was right, but I entered too early and used too much size. Next session I will test a defined-risk spread.",
+                key="reflection_input",
+            )
+
             # Finish & Report
             st.markdown('<div class="section-title">Finish Session & Report</div>', unsafe_allow_html=True)
             if not st.session_state.session_finished:
-                if st.button("🏁 Finish Session & Generate PDF Report", use_container_width=True, type="primary", key="btn_finish"):
+                if st.button("Finish Session & Generate PDF Report", use_container_width=True, type="primary", key="btn_finish"):
                     cancel_pending_order_records(st.session_state.get("pending_limits", []), "finish_session")
                     st.session_state.pending_limits = []
                     # Close remaining
@@ -3176,12 +3739,6 @@ def main():
                                     status="completed"
                                 )
                                 upload_report_record(path, fname)
-                                # report_generated becomes fully true only after storage metadata is persisted
-                                supabase.table("sessions").update({
-                                    "report_generated": True,
-                                    "session_finished": True,
-                                    "trading_locked": True
-                                }).eq("id", st.session_state.supabase_session_id).execute()
                             except Exception as exc:
                                 st.warning(f"PDF generated locally, but cloud report backup failed: {exc}")
 
@@ -3189,15 +3746,58 @@ def main():
                         st.success(f"Report generated: {fname}")
                         if os.path.exists(path):
                             with open(path, "rb") as f:
-                                st.download_button("📥 Download PDF Report", f, file_name=fname, mime="application/pdf")
+                                st.download_button("Download PDF Report", f, file_name=fname, mime="application/pdf")
                     st.rerun()
             else:
                 st.success("Session finished. Report available.")
                 if st.session_state.report_path and os.path.exists(st.session_state.report_path):
                     with open(st.session_state.report_path, "rb") as f:
-                        st.download_button("📥 Download PDF Report", f,
+                        st.download_button("Download PDF Report", f,
                                            file_name=os.path.basename(st.session_state.report_path),
                                            mime="application/pdf")
+
+        # ---------- TAB 5: LEADERBOARD ----------
+        with tab_leaderboard:
+            st.markdown('<div class="section-title">Top 5 — Cumulative Profit</div>', unsafe_allow_html=True)
+            st.caption(
+                "Ranked by cumulative P&L across completed sessions. The table refreshes automatically from Supabase."
+            )
+
+            def _draw_leaderboard():
+                lb = get_leaderboard()
+                if lb:
+                    lb_df = pd.DataFrame(lb)
+                    preferred = [c for c in ["rank", "student_id", "student_name", "total_profit", "completed_sessions", "total_trades", "overall_win_rate_pct"] if c in lb_df.columns]
+                    lb_df = lb_df[preferred].rename(columns={
+                        "rank": "Rank",
+                        "student_id": "Student ID",
+                        "student_name": "Student Name",
+                        "total_profit": "Total Profit (₹)",
+                        "completed_sessions": "Sessions",
+                        "total_trades": "Trades",
+                        "overall_win_rate_pct": "Win Rate %",
+                    })
+                    st.dataframe(
+                        lb_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Total Profit (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Win Rate %": st.column_config.NumberColumn(format="%.1f%%"),
+                        },
+                    )
+                    st.caption("Completed sessions only · refresh interval 10 seconds")
+                else:
+                    st.info("The leaderboard will appear after the first completed session is recorded.")
+
+            # Streamlit >=1.37 supports fragment-level auto-refresh; older local installs fall back gracefully.
+            if hasattr(st, "fragment"):
+                @st.fragment(run_every="10s")
+                def _leaderboard_fragment():
+                    _draw_leaderboard()
+                _leaderboard_fragment()
+            else:
+                _draw_leaderboard()
 
         # ===== AUTO-PLAY =====
         # Each bar = 5 sim-minutes. 1 real second = 1 sim minute → 5s per bar at 1x.
