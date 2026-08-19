@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v2.1"
+APP_VERSION = "v2.2"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -407,6 +407,75 @@ def finish_session_record(current_price=None, current_day_num=None, status="comp
     if status != "active":
         delete_progress_snapshot()
 
+
+
+def sync_live_session_metrics(force=False):
+    """
+    Keep the current student_sessions row current while the market is still active.
+
+    Leaderboard logic uses realized P&L only. Open/unrealized P&L is never written
+    into the leaderboard score. To avoid excessive Supabase traffic, this function
+    writes only when realized P&L or the number of closed trades changes.
+    """
+    sid = st.session_state.get("supabase_session_id")
+    if not supabase_enabled() or not sid:
+        return False
+
+    closed = [
+        t for t in st.session_state.get("tradebook", [])
+        if t.get("status") == "Closed"
+    ]
+    realized = float(st.session_state.get("realized_pnl", 0.0))
+    closed_count = len(closed)
+
+    sync_key = (round(realized, 8), closed_count)
+    if not force and st.session_state.get("_leaderboard_sync_key") == sync_key:
+        return False
+
+    pnls = [float(t.get("pnl", 0.0) or 0.0) for t in closed]
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x < 0]
+
+    starting = float(st.session_state.get("starting_capital", 10000000.0))
+    peak_margin = float(st.session_state.get("peak_margin_used", 0.0))
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    holding = [float(t.get("holding_minutes", 0.0) or 0.0) for t in closed]
+    strategies = {str(t.get("strategy_name") or "Manual trade") for t in closed}
+
+    payload = {
+        # Keep status unchanged; this is only a live analytics refresh.
+        "ending_equity": starting + realized,
+        "total_pnl": realized,
+        "return_pct": (realized / starting * 100.0) if starting > 0 else 0.0,
+        "max_drawdown": float(st.session_state.get("max_drawdown", 0.0)),
+        "max_drawdown_pct": float(st.session_state.get("max_drawdown_pct", 0.0)),
+        "peak_margin_used": peak_margin,
+        "return_on_margin_pct": (realized / peak_margin * 100.0) if peak_margin > 0 else 0.0,
+        "total_trades": closed_count,
+        "winning_trades": len(wins),
+        "losing_trades": len(losses),
+        "win_rate_pct": (len(wins) / closed_count * 100.0) if closed_count else 0.0,
+        "avg_profit_trade": (sum(wins) / len(wins)) if wins else 0.0,
+        "avg_loss_trade": (sum(losses) / len(losses)) if losses else 0.0,
+        "best_trade_pnl": max(pnls) if pnls else 0.0,
+        "worst_trade_pnl": min(pnls) if pnls else 0.0,
+        "profit_factor": (
+            gross_profit / gross_loss
+            if gross_loss > 0
+            else (gross_profit if gross_profit > 0 else 0.0)
+        ),
+        "avg_holding_minutes": (sum(holding) / len(holding)) if holding else 0.0,
+        "strategies_tried": len(strategies),
+    }
+
+    try:
+        supabase.table("student_sessions").update(payload).eq("id", sid).execute()
+        st.session_state["_leaderboard_sync_key"] = sync_key
+        return True
+    except Exception as exc:
+        print(f"[Supabase] Live session metrics sync failed: {exc}")
+        return False
 
 def upload_report_record(filepath, filename):
     sid = st.session_state.get("supabase_session_id")
@@ -1908,12 +1977,16 @@ def _json_serial(obj):
 
 
 def save_session_state():
-    """Persist to Supabase progress when available; local JSON is fallback-only."""
+    """Persist progress and, when needed, the current realized-session analytics."""
     if supabase_enabled():
         try:
             save_progress_snapshot()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[Supabase] Progress snapshot save failed: {exc}")
+        try:
+            sync_live_session_metrics()
+        except Exception as exc:
+            print(f"[Supabase] Live session analytics save failed: {exc}")
         return
     keys = [
         'current_index', 'playing', 'speed', 'basket', 'positions', 'tradebook',
@@ -2392,7 +2465,7 @@ def main():
     st.markdown("""
     <div class="fixed-header">
         <h1>NIFTY Options Trading Simulator</h1>
-        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.1.0</p>
+        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.2.0</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -3860,39 +3933,60 @@ def main():
 
         # ---------- TAB 5: LEADERBOARD ----------
         with tab_leaderboard:
-            st.markdown('<div class="section-title">Top 5 — Cumulative Profit</div>', unsafe_allow_html=True)
+            st.markdown(
+                '<div class="section-title">Top 5 — Best Single-Session Realized P&L</div>',
+                unsafe_allow_html=True
+            )
             st.caption(
-                "Ranked by cumulative P&L across completed sessions. The table refreshes automatically from Supabase."
+                "Each market run is treated independently. A student's sessions are never added together. "
+                "The leaderboard uses that student's highest realized P&L from any session, including an active "
+                "session once at least one trade has been closed."
             )
 
             def _draw_leaderboard():
                 lb = get_leaderboard()
                 if lb:
                     lb_df = pd.DataFrame(lb)
-                    preferred = [c for c in ["rank", "student_id", "student_name", "total_profit", "completed_sessions", "total_trades", "overall_win_rate_pct"] if c in lb_df.columns]
+                    preferred = [
+                        c for c in [
+                            "rank", "student_id", "student_name",
+                            "best_session_profit", "best_session_no",
+                            "best_session_status", "closed_trades",
+                            "win_rate_pct", "max_drawdown_pct"
+                        ]
+                        if c in lb_df.columns
+                    ]
                     lb_df = lb_df[preferred].rename(columns={
                         "rank": "Rank",
                         "student_id": "Student ID",
                         "student_name": "Student Name",
-                        "total_profit": "Total Profit (₹)",
-                        "completed_sessions": "Sessions",
-                        "total_trades": "Trades",
-                        "overall_win_rate_pct": "Win Rate %",
+                        "best_session_profit": "Best Realized P&L (₹)",
+                        "best_session_no": "Best Session",
+                        "best_session_status": "Session Status",
+                        "closed_trades": "Closed Trades",
+                        "win_rate_pct": "Win Rate %",
+                        "max_drawdown_pct": "Max Drawdown %",
                     })
                     st.dataframe(
                         lb_df,
                         use_container_width=True,
                         hide_index=True,
                         column_config={
-                            "Total Profit (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+                            "Best Realized P&L (₹)": st.column_config.NumberColumn(format="₹%.2f"),
                             "Win Rate %": st.column_config.NumberColumn(format="%.1f%%"),
+                            "Max Drawdown %": st.column_config.NumberColumn(format="%.2f%%"),
                         },
                     )
-                    st.caption("Completed sessions only · refresh interval 10 seconds")
+                    st.caption(
+                        "Best single independent session only · realized P&L only · "
+                        "open P&L is excluded · refresh interval 10 seconds"
+                    )
                 else:
-                    st.info("The leaderboard will appear after the first completed session is recorded.")
+                    st.info(
+                        "The leaderboard will appear after at least one student closes a trade "
+                        "and realizes P&L in a session."
+                    )
 
-            # Streamlit >=1.37 supports fragment-level auto-refresh; older local installs fall back gracefully.
             if hasattr(st, "fragment"):
                 @st.fragment(run_every="10s")
                 def _leaderboard_fragment():
@@ -3901,38 +3995,57 @@ def main():
             else:
                 _draw_leaderboard()
 
-        # ===== STABLE MARKET CLOCK =====
-        # Only the tiny clock fragment refreshes while waiting for the next bar.
-        # The full app reruns only when a new simulated bar is actually due.
+        # ===== LOW-FLICKER MARKET CLOCK =====
+        # Streamlit reconstructs the page on a full rerun. Redrawing every 5 seconds
+        # still produces visible flicker on a large dashboard. We therefore batch
+        # market-bar advancement and perform fewer full redraws.
+        #
+        # At 1x: 1 bar = 5 real seconds, UI redraw approximately every 15 seconds
+        # and advances ~3 bars in one pass. Faster speeds redraw more often, but never
+        # faster than every 5 seconds. The simulated elapsed time remains consistent.
     if st.session_state.playing and st.session_state.current_index < n_bars - 1:
-        delay = TICK_SECONDS_BASE / max(float(st.session_state.speed), 0.1)
-        clock_poll = max(0.25, min(1.0, delay / 4.0))
+        seconds_per_bar = TICK_SECONDS_BASE / max(float(st.session_state.speed), 0.1)
+        ui_refresh_seconds = max(5.0, min(15.0, seconds_per_bar * 3.0))
+        poll_seconds = 1.0
 
-        @st.fragment(run_every=clock_poll)
+        @st.fragment(run_every=poll_seconds)
         def _market_clock_fragment():
             if not st.session_state.get("playing", False):
                 return
 
             now = time.time()
-            elapsed = now - float(st.session_state.get("last_update", now))
-            if elapsed < delay:
+            last = float(st.session_state.get("last_update", now))
+            elapsed = now - last
+
+            if elapsed < ui_refresh_seconds:
                 return
 
-            # Advance only once per due bar. No 0.3-second full-page rerun loop.
-            st.session_state.current_index = min(
-                int(st.session_state.current_index) + 1,
+            bars_due = max(1, int(elapsed / max(seconds_per_bar, 0.001)))
+            new_index = min(
+                int(st.session_state.current_index) + bars_due,
                 n_bars - 1,
             )
+
+            if new_index == int(st.session_state.current_index):
+                return
+
+            st.session_state.current_index = new_index
             st.session_state.max_reached_index = max(
                 int(st.session_state.get("max_reached_index", 0)),
-                int(st.session_state.current_index),
+                new_index,
             )
-            st.session_state.last_update = now
 
-            if st.session_state.current_index % 5 == 0:
-                save_session_state()
+            # Preserve unconsumed elapsed time so the simulated clock does not drift.
+            consumed = bars_due * seconds_per_bar
+            st.session_state.last_update = last + consumed
+            if st.session_state.last_update > now:
+                st.session_state.last_update = now
 
-            st.rerun()  # one full redraw per completed bar
+            # Save once per visible batch rather than on every hidden bar.
+            save_session_state()
+
+            # One full page redraw per batch, not one per individual 5-minute bar.
+            st.rerun()
 
         _market_clock_fragment()
 
