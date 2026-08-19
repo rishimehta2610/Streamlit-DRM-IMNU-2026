@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v2.0"
+APP_VERSION = "v2.1"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -1877,22 +1877,10 @@ def calculate_realistic_margin(items, spot, lot_size):
             a['qty'] -= covered
             b['qty'] -= covered
 
-    # Pass 2: any short quantity still uncovered -- try pairing with ANOTHER short
-    # leg of the same type at a different strike (e.g. two different naked shorts),
-    # same reduced-margin treatment as a defined-risk pair.
-    for i, a in enumerate(short_legs):
-        if a['qty'] <= 0:
-            continue
-        for j, b in enumerate(short_legs):
-            if j <= i or b['qty'] <= 0 or b['type'] != a['type'] or b['strike'] == a['strike']:
-                continue
-            width = abs(a['strike'] - b['strike'])
-            covered = min(a['qty'], b['qty'])
-            total_margin += width * covered * 0.15 + max(a['premium'], b['premium']) * covered
-            a['qty'] -= covered
-            b['qty'] -= covered
+    # Uncovered short options remain naked. Two short options at different strikes do
+    # not cap one another's loss, so they must NOT receive defined-risk spread margin.
 
-    # Whatever short quantity is left after both passes is genuinely naked.
+    # Whatever short quantity is left after long-leg offsets is genuinely naked.
     for a in short_legs:
         if a['qty'] > 0:
             notional = a['strike'] * a['qty']
@@ -2157,31 +2145,40 @@ def generate_pdf_report():
 
 
 def _settle_all_cash(spot, current_dt):
-    """Cash-settle every open position at intrinsic value and clear the book."""
-    if not st.session_state.positions:
-        return
+    """Cash-settle every open trade at intrinsic value and finalize analytics."""
     realized_add = 0.0
-    for pos in list(st.session_state.positions):
-        if pos['type'] == 'FUT':
+
+    for t in st.session_state.get("tradebook", []):
+        if t.get("status") != "Open":
+            continue
+
+        typ = t.get("type")
+        strike = float(t.get("strike", 0.0) or 0.0)
+        if typ == "FUT":
             intrinsic = float(spot)
+        elif typ == "CE":
+            intrinsic = max(float(spot) - strike, 0.0)
         else:
-            intrinsic = max(spot - pos['strike'], 0.0) if pos['type'] == 'CE' else max(pos['strike'] - spot, 0.0)
-        for t in st.session_state.tradebook:
-            if (t['strike'] == pos['strike'] and t['type'] == pos['type']
-                    and t['status'] == 'Open' and t['side'] == pos['side']):
-                t['exit_time'] = current_dt.strftime('%H:%M:%S')
-                t['exit_price'] = intrinsic
-                sign = 1 if t['side'] == 'Buy' else -1
-                t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
-                t['status'] = 'Closed'
-                try:
-                    close_trade_record(t, current_dt, t['exit_price'], "expiry_or_week_end")
-                except Exception:
-                    pass
-                realized_add += t['pnl']
-                break
+            intrinsic = max(strike - float(spot), 0.0)
+
+        t["exit_time"] = current_dt.strftime("%H:%M:%S")
+        t["exit_price"] = float(intrinsic)
+        sign = 1 if t.get("side") == "Buy" else -1
+        qty = int(t.get("qty", 0) or 0)
+        entry = float(t.get("entry_price", 0.0) or 0.0)
+        t["pnl"] = sign * (t["exit_price"] - entry) * qty
+        t["status"] = "Closed"
+
+        try:
+            close_trade_record(t, current_dt, t["exit_price"], "expiry_or_week_end")
+        except Exception as exc:
+            print(f"[Supabase] Failed to settle trade at week end: {exc}")
+
+        realized_add += float(t["pnl"])
+
     st.session_state.realized_pnl += realized_add
-    st.session_state.positions = []
+    _rebuild_positions_from_open_trades()
+    return realized_add
 
 
 
@@ -2233,8 +2230,56 @@ def _close_all_open_trades_at_market(current_price, current_dt, chain_df, reason
         realized_add += float(t["pnl"])
 
     st.session_state.realized_pnl += realized_add
-    st.session_state.positions = []
+    _rebuild_positions_from_open_trades()
     return realized_add
+
+
+def _rebuild_positions_from_open_trades():
+    """Keep the margin/Greeks position list exactly aligned with open tradebook rows."""
+    rebuilt = []
+    for t in st.session_state.get("tradebook", []):
+        if t.get("status") != "Open":
+            continue
+        qty = int(t.get("qty", 0) or 0)
+        lots = int(t.get("lots", 0) or 0)
+        if lots <= 0:
+            lot_size = max(int(st.session_state.get("lot_size", 65)), 1)
+            lots = max(1, int(round(qty / lot_size))) if qty else 1
+        rebuilt.append({
+            "strike": t.get("strike"),
+            "type": t.get("type"),
+            "side": t.get("side"),
+            "entry_price": float(t.get("entry_price", 0.0) or 0.0),
+            "quantity": qty,
+            "lots": lots,
+        })
+    st.session_state.positions = rebuilt
+
+
+def _close_one_trade_at_market(t, current_price, current_dt, chain_df, reason="manual"):
+    """Close exactly one open trade and persist the result."""
+    if not t or t.get("status") != "Open":
+        return 0.0
+
+    exit_price = _mark_open_trade(t, current_price, chain_df)
+    t["exit_time"] = current_dt.strftime("%H:%M:%S")
+    t["exit_price"] = float(exit_price)
+
+    sign = 1 if t.get("side") == "Buy" else -1
+    qty = int(t.get("qty", 0) or 0)
+    entry_price = float(t.get("entry_price", 0.0) or 0.0)
+    pnl = sign * (t["exit_price"] - entry_price) * qty
+    t["pnl"] = float(pnl)
+    t["status"] = "Closed"
+
+    try:
+        close_trade_record(t, current_dt, t["exit_price"], reason)
+    except Exception as exc:
+        print(f"[Supabase] Failed to close trade record ({reason}): {exc}")
+
+    st.session_state.realized_pnl += float(pnl)
+    _rebuild_positions_from_open_trades()
+    return float(pnl)
 
 def match_pending_limits(current_price, current_dt, chain_df, lot_size):
     """
@@ -2347,7 +2392,7 @@ def main():
     st.markdown("""
     <div class="fixed-header">
         <h1>NIFTY Options Trading Simulator</h1>
-        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.0.4</p>
+        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.1.0</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2900,7 +2945,7 @@ def main():
             # Clean tight order-entry row
             c1, c2, c3, c4, c5, c6 = st.columns([1.0, 0.9, 1.2, 0.8, 1.1, 1.0])
             with c1:
-                side = st.selectbox("Side", ["BUY", "SELL"], key="ord_side")
+                side = st.radio("Side", ["BUY", "SELL"], horizontal=True, key="ord_side")
             with c2:
                 otype = st.selectbox("Type", ["CE", "PE"], key="ord_type")
             with c3:
@@ -3447,76 +3492,95 @@ def main():
 
         # ---------- TAB 2: POSITIONS ----------
         with tab_pos:
-            st.markdown('<div class="section-title">Your Positions</div>', unsafe_allow_html=True)
-            if cons_pos:
-                for idx, pos in enumerate(cons_pos):
-                    pnl_cls = "profit" if pos['pnl'] >= 0 else "loss"
-                    side_cls = "pos-side-buy" if pos['side'] == 'Buy' else "pos-side-sell"
-                    cols = st.columns([6, 2, 1])
+            st.markdown('<div class="section-title">Open Trades</div>', unsafe_allow_html=True)
+            st.caption(
+                "Each executed BUY or SELL remains visible as its own open trade. "
+                "Exit closes only that trade; Exit All closes every open trade."
+            )
+
+            open_trades = [
+                t for t in st.session_state.get("tradebook", [])
+                if t.get("status") == "Open"
+            ]
+
+            if open_trades:
+                for t in open_trades:
+                    mark = _mark_open_trade(t, current_price, chain_df)
+                    sign = 1 if t.get("side") == "Buy" else -1
+                    qty = int(t.get("qty", 0) or 0)
+                    entry = float(t.get("entry_price", 0.0) or 0.0)
+                    trade_pnl = sign * (float(mark) - entry) * qty
+                    pnl_cls = "profit" if trade_pnl >= 0 else "loss"
+                    side_cls = "pos-side-buy" if t.get("side") == "Buy" else "pos-side-sell"
+
+                    trade_key = (
+                        t.get("supabase_trade_id")
+                        or f"{t.get('entry_time','')}_{t.get('strike','')}_{t.get('type','')}_{t.get('side','')}_{qty}"
+                    )
+                    trade_key = str(trade_key).replace(" ", "_").replace(":", "_")
+
+                    cols = st.columns([6, 2, 1.2])
                     with cols[0]:
-                        st.markdown(f"""
-                        <div>
-                            <div class="pos-instrument">
-                                <span class="{side_cls}">{pos['side']}</span>
-                                &nbsp;{instrument_label(pos['strike'], pos['type'])}
+                        st.markdown(
+                            f"""
+                            <div>
+                                <div class="pos-instrument">
+                                    <span class="{side_cls}">{t.get('side','')}</span>
+                                    &nbsp;{instrument_label(t.get('strike'), t.get('type'))}
+                                </div>
+                                <div class="pos-meta">
+                                    Qty {qty:,} · Entry ₹{entry:.2f} · LTP ₹{float(mark):.2f}
+                                    · {t.get('strategy_name') or 'Manual trade'}
+                                </div>
                             </div>
-                            <div class="pos-meta">
-                                {abs(pos['net_qty'])} {'units' if pos['type'] == 'FUT' else 'shares'} · Avg ₹{pos['avg_price']:.2f} · LTP ₹{pos['current_price']:.2f}
-                            </div>
-                        </div>
-                        """, unsafe_allow_html=True)
+                            """,
+                            unsafe_allow_html=True,
+                        )
                     with cols[1]:
-                        st.markdown(f"<div style='text-align:right;font-weight:700;font-size:16px;' class='{pnl_cls}'>₹{pos['pnl']:+,.2f}</div>", unsafe_allow_html=True)
+                        st.markdown(
+                            f"<div style='text-align:right;font-weight:700;font-size:16px;' "
+                            f"class='{pnl_cls}'>₹{trade_pnl:+,.2f}</div>",
+                            unsafe_allow_html=True,
+                        )
                     with cols[2]:
-                        if st.button("Exit", key=f"exit_{idx}", disabled=st.session_state.trading_locked):
-                            st.session_state.playing = False  # pause so exit is immediate
-                            to_remove = []
-                            realized_add = 0.0
-                            for i, orig in enumerate(st.session_state.positions):
-                                if orig['strike'] == pos['strike'] and orig['type'] == pos['type']:
-                                    for t in st.session_state.tradebook:
-                                        if (t['strike'] == orig['strike'] and t['type'] == orig['type']
-                                                and t['status'] == 'Open' and t['side'] == orig['side']):
-                                            t['exit_time'] = current_dt.strftime('%H:%M:%S')
-                                            t['exit_price'] = pos['current_price']
-                                            sign = 1 if t['side'] == 'Buy' else -1
-                                            t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
-                                            t['status'] = 'Closed'
-                                            try:
-                                                close_trade_record(t, current_dt, t['exit_price'], "manual")
-                                            except Exception:
-                                                pass
-                                            realized_add += t['pnl']
-                                            break
-                                    to_remove.append(i)
-                            for i in sorted(to_remove, reverse=True):
-                                del st.session_state.positions[i]
-                            st.session_state.realized_pnl += realized_add
+                        if st.button(
+                            "Exit",
+                            key=f"exit_trade_{trade_key}",
+                            disabled=st.session_state.trading_locked,
+                            use_container_width=True,
+                        ):
+                            st.session_state.playing = False
+                            _close_one_trade_at_market(
+                                t, current_price, current_dt, chain_df, "manual"
+                            )
                             save_session_state()
-                            st.toast("Position exited", icon="✅")
+                            st.toast("Trade exited", icon="✅")
                             st.rerun()
 
-                if st.button("Exit All", use_container_width=True, key="btn_exit_all",
-                             disabled=st.session_state.trading_locked):
-                    st.session_state.playing = False  # pause so exit is immediate
+                if st.button(
+                    "Exit All",
+                    use_container_width=True,
+                    key="btn_exit_all",
+                    disabled=st.session_state.trading_locked,
+                ):
+                    st.session_state.playing = False
                     _close_all_open_trades_at_market(
                         current_price, current_dt, chain_df, "manual_exit_all"
                     )
                     save_session_state()
-                    st.toast("All positions exited", icon="✅")
+                    st.toast("All open trades exited", icon="✅")
                     st.rerun()
 
-                # Total Open P&L
+                # Portfolio-level summary remains netted for risk interpretation.
                 st.markdown(f"""
                 <div class="pnl-row" style="margin-top:12px; background:#f8f9fb;">
                     <span class="pnl-label">Total Open P&L</span>
-                    <span class="pnl-value {open_cls}">₹{open_pnl:+,.2f}</span>
+                    <span class="pnl-value {'profit' if open_pnl >= 0 else 'loss'}">₹{open_pnl:+,.2f}</span>
                 </div>
                 """, unsafe_allow_html=True)
 
-                # Net Greeks
                 greeks = compute_position_greeks(st.session_state.positions, current_price, T_current)
-                st.markdown("**Net Greeks**")
+                st.markdown("**Net Portfolio Greeks**")
                 st.markdown(f"""
                 <div>
                     <span class="greek-box"><span class="greek-label">Δ</span> {greeks['delta']:+.1f}</span>
@@ -3525,22 +3589,12 @@ def main():
                     <span class="greek-box"><span class="greek-label">Vega</span> {greeks['vega']:+.2f}</span>
                 </div>
                 """, unsafe_allow_html=True)
-                st.markdown(
-                    '<div class="hint-line">'
-                    f'<b>{glossary_term("delta", "Δ Delta")}</b> — ₹ P&amp;L change per 1-point move in NIFTY. '
-                    f'<b>{glossary_term("gamma", "Γ Gamma")}</b> — how fast Delta itself changes as spot moves. '
-                    f'<b>{glossary_term("theta", "Θ Theta")}</b> — ₹ P&amp;L lost per day just from time passing, all else equal. '
-                    f'<b>{glossary_term("vega", "Vega")}</b> — ₹ P&amp;L change per 1 percentage-point move in implied volatility.'
-                    '</div>',
-                    unsafe_allow_html=True
-                )
 
-                # Payoff diagram for currently open positions
                 _open_stats = analyze_payoff(st.session_state.positions)
                 _omp_txt = "Unlimited" if _open_stats['max_profit'] is None else f"₹{_open_stats['max_profit']:,.0f}"
                 _oml_txt = "Unlimited" if _open_stats['max_loss'] is None else f"₹{_open_stats['max_loss']:,.0f}"
                 _obe_txt = ", ".join(f"₹{b:,.0f}" for b in _open_stats['breakevens']) or "—"
-                st.markdown("**Payoff at Expiry (Open Positions)**")
+                st.markdown("**Combined Payoff at Expiry**")
                 st.markdown(f"""
                 <div class="preview-box">
                     <div class="preview-grid">
@@ -3553,14 +3607,21 @@ def main():
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
-                with st.expander("📈 Show payoff diagram", expanded=False):
-                    fig_open, _ = render_payoff_diagram(st.session_state.positions, current_price, title="Open Positions — Combined Payoff at Expiry")
-                    st.plotly_chart(fig_open, use_container_width=True, config={'displayModeBar': False})
+                with st.expander("Show combined payoff diagram", expanded=False):
+                    fig_open, _ = render_payoff_diagram(
+                        st.session_state.positions,
+                        current_price,
+                        title="Open Trades — Combined Payoff at Expiry",
+                    )
+                    st.plotly_chart(
+                        fig_open,
+                        use_container_width=True,
+                        config={"displayModeBar": False},
+                    )
             else:
                 st.markdown(
-                    '<div class="empty-box">📭 No open positions yet. Go to <b>Place Order</b> to buy or '
-                    'sell your first call/put — your positions and live P&amp;L will appear here.</div>',
-                    unsafe_allow_html=True
+                    '<div class="empty-box">No open trades. Use <b>Place Order</b> to BUY or SELL a call/put.</div>',
+                    unsafe_allow_html=True,
                 )
 
         # ---------- TAB 3: VIEW GRAPH ----------
@@ -3840,30 +3901,46 @@ def main():
             else:
                 _draw_leaderboard()
 
-        # ===== AUTO-PLAY =====
-        # Each bar = 5 sim-minutes. 1 real second = 1 sim minute → 5s per bar at 1x.
+        # ===== STABLE MARKET CLOCK =====
+        # Only the tiny clock fragment refreshes while waiting for the next bar.
+        # The full app reruns only when a new simulated bar is actually due.
     if st.session_state.playing and st.session_state.current_index < n_bars - 1:
-        now = time.time()
-        elapsed = now - st.session_state.last_update
-        delay = TICK_SECONDS_BASE / max(st.session_state.speed, 0.1)
-        if elapsed >= delay:
-            st.session_state.current_index += 1
-            if st.session_state.current_index > st.session_state.max_reached_index:
-                st.session_state.max_reached_index = st.session_state.current_index
+        delay = TICK_SECONDS_BASE / max(float(st.session_state.speed), 0.1)
+        clock_poll = max(0.25, min(1.0, delay / 4.0))
+
+        @st.fragment(run_every=clock_poll)
+        def _market_clock_fragment():
+            if not st.session_state.get("playing", False):
+                return
+
+            now = time.time()
+            elapsed = now - float(st.session_state.get("last_update", now))
+            if elapsed < delay:
+                return
+
+            # Advance only once per due bar. No 0.3-second full-page rerun loop.
+            st.session_state.current_index = min(
+                int(st.session_state.current_index) + 1,
+                n_bars - 1,
+            )
+            st.session_state.max_reached_index = max(
+                int(st.session_state.get("max_reached_index", 0)),
+                int(st.session_state.current_index),
+            )
             st.session_state.last_update = now
+
             if st.session_state.current_index % 5 == 0:
                 save_session_state()
-            st.rerun()
-        else:
-            remaining = max(0, delay - elapsed)
-            time.sleep(min(0.3, remaining))
-            st.rerun()
+
+            st.rerun()  # one full redraw per completed bar
+
+        _market_clock_fragment()
+
     elif st.session_state.current_index >= n_bars - 1:
-        # Week complete: stop clock, cash-settle any open positions, lock trading
         st.session_state.playing = False
-        if st.session_state.positions and not st.session_state.trading_locked:
+        if any(t.get("status") == "Open" for t in st.session_state.get("tradebook", [])) \
+                and not st.session_state.trading_locked:
             _settle_all_cash(current_price, current_dt)
-            st.toast("Session week complete — all open positions cash-settled", icon="📅")
         st.session_state.pending_limits = []
         st.session_state.trading_locked = True
         save_session_state()
