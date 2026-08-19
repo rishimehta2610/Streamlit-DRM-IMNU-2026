@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v2.4"
+APP_VERSION = "v2.5.1"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -159,16 +159,17 @@ def create_or_get_participant(student_name, student_id, email=""):
     existing = get_participant_by_student_id(student_id)
     now = datetime.now().isoformat()
     if existing:
+        # Identity lock: once a Student ID exists, its stored name is canonical.
+        # A returning user resumes under the original profile instead of creating
+        # another identity or overwriting the name attached to that roll number.
         updates = {"last_active_at": now}
-        # Preserve the stored name unless a non-empty corrected name was supplied.
-        if student_name and student_name != existing.get("student_name"):
-            updates["student_name"] = student_name
-        if email and email != (existing.get("email") or ""):
+        if email and not (existing.get("email") or ""):
+            # Allow an email to be added once if the original profile had none.
             updates["email"] = email
         try:
             supabase.table("participants").update(updates).eq("id", existing["id"]).execute()
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[Supabase] Participant activity update failed: {exc}")
         return {**existing, **updates}
 
     payload = {
@@ -198,10 +199,35 @@ def _next_session_no(participant_id):
 
 
 def create_session_record():
-    """Create one clean analytical row per simulator run."""
+    """
+    Create one analytical row per independent 5-day market run.
+
+    A Student ID may have many historical sessions, but never two separate ACTIVE
+    sessions at the same time. Returning students must resume the existing run.
+    """
     if not supabase_enabled() or not st.session_state.get("participant_id"):
         return None
     participant_id = st.session_state.participant_id
+
+    try:
+        active_resp = (
+            supabase.table("student_sessions")
+            .select("id,session_no,status")
+            .eq("participant_id", participant_id)
+            .eq("status", "active")
+            .order("session_no", desc=True)
+            .limit(1)
+            .execute()
+        )
+        active_rows = _sb_data(active_resp)
+        if active_rows:
+            existing = active_rows[0]
+            st.session_state.supabase_session_id = existing["id"]
+            st.session_state.session_no = existing.get("session_no")
+            return existing["id"]
+    except Exception as exc:
+        print(f"[Supabase] Active-session lookup failed: {exc}")
+
     payload = {
         "participant_id": participant_id,
         "session_no": _next_session_no(participant_id),
@@ -1977,10 +2003,14 @@ def _json_serial(obj):
 
 
 def save_session_state():
-    """Persist progress and, when needed, the current realized-session analytics."""
+    """Persist only resumable sessions; completed 5-day runs remain historical records."""
     if supabase_enabled():
         try:
-            save_progress_snapshot()
+            if st.session_state.get("session_finished", False):
+                # A completed run must not be restored as an unfinished session later.
+                delete_progress_snapshot()
+            else:
+                save_progress_snapshot()
         except Exception as exc:
             print(f"[Supabase] Progress snapshot save failed: {exc}")
         try:
@@ -2515,6 +2545,164 @@ def match_pending_limits(current_price, current_dt, chain_df, lot_size):
 
 
 # ============ MAIN APP ============
+
+def _finalize_five_day_session(current_price, current_dt, current_day_num, chain_df=None):
+    """
+    Finalize the current independent 5-day attempt exactly once.
+
+    - cash-settle every remaining open trade;
+    - cancel pending limits;
+    - freeze the final realized P&L for this session;
+    - generate/upload the current session PDF;
+    - mark the analytical session completed;
+    - remove resumable progress so the next run starts as a new independent session.
+    """
+    if st.session_state.get("session_finished", False):
+        return
+
+    st.session_state.playing = False
+
+    if any(t.get("status") == "Open" for t in st.session_state.get("tradebook", [])):
+        _settle_all_cash(current_price, current_dt)
+
+    cancel_pending_order_records(st.session_state.get("pending_limits", []), "week_end")
+    st.session_state.pending_limits = []
+    st.session_state.trading_locked = True
+
+    # Generate the report automatically at the end of the five-day market so the
+    # completed run has a frozen report before the user starts another attempt.
+    try:
+        path, fname = generate_pdf_report()
+        st.session_state.report_path = path
+        st.session_state.report_generated = True
+        st.session_state.report_filename = fname
+    except Exception as exc:
+        print(f"[Report] Automatic week-end PDF generation failed: {exc}")
+        path, fname = None, None
+
+    st.session_state.session_finished = True
+
+    if supabase_enabled():
+        try:
+            finish_session_record(
+                current_price=current_price,
+                current_day_num=current_day_num,
+                status="completed",
+            )
+        except Exception as exc:
+            print(f"[Supabase] Week-end session finalization failed: {exc}")
+
+        if path and fname:
+            try:
+                upload_report_record(path, fname)
+            except Exception as exc:
+                print(f"[Supabase] Automatic week-end report upload failed: {exc}")
+
+    # Do not recreate student_progress after completion.
+    save_session_state()
+
+
+def _prepare_new_five_day_session():
+    """
+    Leave the student's identity intact but clear the completed market run.
+
+    The next Start Session action creates a NEW student_sessions row. If the student
+    leaves before a run ends, this function is never invoked and the same Student ID
+    resumes the old progress instead.
+    """
+    preserve = {
+        "participant_id", "student_name", "student_id", "student_email",
+        "starting_capital", "lot_size",
+    }
+    kept = {k: st.session_state.get(k) for k in preserve if k in st.session_state}
+
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+
+    # Restore base defaults first, then identity/settings.
+    for key, value in defaults.items():
+        st.session_state[key] = value
+    for key, value in kept.items():
+        st.session_state[key] = value
+
+    st.session_state.data_loaded = False
+    st.session_state.playing = False
+    st.session_state.trading_locked = False
+    st.session_state.session_finished = False
+    st.session_state.report_generated = False
+    st.session_state.report_path = None
+    st.session_state.supabase_session_id = None
+    st.session_state.session_no = None
+    st.session_state.realized_pnl = 0.0
+    st.session_state.positions = []
+    st.session_state.tradebook = []
+    st.session_state.pending_limits = []
+    st.session_state.basket = []
+    st.session_state.current_index = 0
+    st.session_state.max_reached_index = 0
+
+    delete_progress_snapshot()
+
+
+def _render_session_complete_panel():
+    """Clear end-of-session message plus report download and new-session action."""
+    final_pnl = float(st.session_state.get("realized_pnl", 0.0))
+    session_no = st.session_state.get("session_no") or "—"
+
+    st.markdown(
+        f"""
+        <div style="border:1px solid #f0c36d; background:#fff8e7; padding:16px 18px;
+                    border-radius:10px; margin:10px 0 14px 0;">
+            <div style="font-size:18px;font-weight:800;color:#23364d;">
+                5-Day Session Complete
+            </div>
+            <div style="margin-top:6px;color:#4b5563;">
+                Session {session_no} has reached the end of the five trading days.
+                Final realized P&amp;L: <b>₹{final_pnl:+,.2f}</b>.
+            </div>
+            <div style="margin-top:8px;color:#8a5a00;">
+                <b>Download this session's PDF report before starting the next simulation.</b>
+                The current on-screen/local report may no longer be available after a new
+                session starts or the app is redeployed.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    report_path = st.session_state.get("report_path")
+    if report_path and os.path.exists(report_path):
+        with open(report_path, "rb") as f:
+            st.download_button(
+                "Download Current Session PDF",
+                f,
+                file_name=os.path.basename(report_path),
+                mime="application/pdf",
+                use_container_width=True,
+                key="download_completed_session_pdf",
+            )
+    else:
+        st.warning(
+            "The local PDF copy is not available on this app instance. "
+            "If a cloud backup was successfully created, the session record remains stored."
+        )
+
+    if st.button(
+        "Start New 5-Day Session",
+        type="primary",
+        use_container_width=True,
+        key="start_new_5day_session",
+    ):
+        _prepare_new_five_day_session()
+        st.rerun()
+
+
+if hasattr(st, "dialog"):
+    @st.dialog("5-Day Session Complete", width="large")
+    def _session_complete_dialog():
+        _render_session_complete_panel()
+
+
 def main():
     # Keep a local copy synchronized with the persisted/session lot size.
     # Required by pricing, margin calculations, strategy legs and pending-limit matching.
@@ -2535,7 +2723,7 @@ def main():
     st.markdown("""
     <div class="fixed-header">
         <h1>NIFTY Options Trading Simulator</h1>
-        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.4.0</p>
+        <p>DRM IMBA 2026 · Academic simulation environment · Build 2.5.1</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2846,18 +3034,17 @@ def main():
         st.session_state.trading_locked = True
         save_session_state()
 
-    # End of simulated week (last bar reached): settle + lock
-    if st.session_state.current_index >= n_bars - 1:
-        st.session_state.playing = False
-        if st.session_state.positions and not st.session_state.trading_locked:
-            _settle_all_cash(current_price, current_dt)
-            st.toast("Session week complete — all open positions cash-settled", icon="📅")
-        cancel_pending_order_records(st.session_state.pending_limits, "week_end")
-        st.session_state.pending_limits = []  # cancel unfilled limits at week end
-        st.session_state.trading_locked = True
-
     st.session_state.chain_df = generate_option_chain(current_price, prev_close, T_current)
     chain_df = st.session_state.chain_df
+
+    # End of simulated week: finalize this independent 5-day attempt exactly once.
+    if st.session_state.current_index >= n_bars - 1 and not st.session_state.get("session_finished", False):
+        _finalize_five_day_session(
+            current_price=current_price,
+            current_dt=current_dt,
+            current_day_num=current_day_num,
+            chain_df=chain_df,
+        )
 
     # Continuous limit-order matching against live LTPs
     n_filled = match_pending_limits(current_price, current_dt, chain_df, int(st.session_state.get("lot_size", 65)))
@@ -2948,6 +3135,12 @@ def main():
 
         st.markdown("<br>", unsafe_allow_html=True)
 
+        if st.session_state.get("session_finished", False):
+            st.info(
+                "5-day market completed. This run is closed. Click GO LIVE to view the "
+                "session-complete notice, download the current PDF report, or start a new 5-day session."
+            )
+
         # ===== PROMINENT GO LIVE / PAUSE =====
         if not st.session_state.playing:
             st.markdown("""
@@ -2964,11 +3157,31 @@ def main():
             }
             </style>
             """, unsafe_allow_html=True)
-            if st.button("GO LIVE", use_container_width=True, type="primary", key="btn_golive",
-                         disabled=st.session_state.trading_locked):
-                st.session_state.playing = True
-                st.session_state.last_update = time.time()
-                st.rerun()
+            if st.session_state.get("session_finished", False) or st.session_state.current_index >= n_bars - 1:
+                if st.button(
+                    "GO LIVE",
+                    use_container_width=True,
+                    type="primary",
+                    key="btn_golive_session_complete",
+                ):
+                    if hasattr(st, "dialog"):
+                        _session_complete_dialog()
+                    else:
+                        st.session_state["_show_session_complete_panel"] = True
+            else:
+                if st.button(
+                    "GO LIVE",
+                    use_container_width=True,
+                    type="primary",
+                    key="btn_golive",
+                    disabled=st.session_state.trading_locked,
+                ):
+                    st.session_state.playing = True
+                    st.session_state.last_update = time.time()
+                    st.rerun()
+
+            if st.session_state.pop("_show_session_complete_panel", False):
+                _render_session_complete_panel()
         else:
             if st.button("PAUSE", use_container_width=True, key="btn_pause"):
                 st.session_state.playing = False
@@ -3016,62 +3229,23 @@ def main():
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Reset high-contrast
+        # Session lifecycle control.
+        # A Student ID must finish the current five-day market before a new independent
+        # run can be started. This prevents creating repeated parallel/restarted attempts.
         st.markdown('<div class="reset-btn-container">', unsafe_allow_html=True)
-        if st.button("RESET SESSION", use_container_width=True, key="btn_reset"):
-            # A reset ends the current run. Close any still-open trades at the current
-            # simulated market price so analytics are not left with orphaned Open trades.
-            if st.session_state.get("tradebook"):
-                _close_all_open_trades_at_market(
-                    current_price, current_dt, chain_df, "session_reset"
-                )
-
-            cancel_pending_order_records(st.session_state.get("pending_limits", []), "session_reset")
-
-            if supabase_enabled() and st.session_state.get("supabase_session_id"):
-                try:
-                    finish_session_record(
-                        current_price=current_price,
-                        current_day_num=current_day_num,
-                        status="reset"
-                    )
-                except Exception as exc:
-                    print(f"[Supabase] Failed to finalize reset session: {exc}")
-
-            for key in list(st.session_state.keys()):
-                if key not in ['data_loaded', 'df_raw', 'simulated_data', 'df_day_scaled',
-                               'start_time', 'session_end', 'expiry_dt', 'scale_factor', 'prev_scaled_close',
-                               'prev_day_close', 'lot_size', 'target_nifty_level', 'starting_capital',
-                               'data_source_choice', 'day_close_map',
-                               'participant_id', 'student_name', 'student_id', 'student_email']:
-                    del st.session_state[key]
-            st.session_state.playing = False
-            st.session_state.current_index = 0
-            st.session_state.max_reached_index = 0
-            st.session_state.basket = []
-            st.session_state.positions = []
-            st.session_state.tradebook = []
-            st.session_state.pending_limits = []
-            st.session_state.realized_pnl = 0.0
-            st.session_state.peak_margin_used = 0.0
-            st.session_state.trading_locked = False
-            st.session_state.session_finished = False
-            st.session_state.report_generated = False
-            st.session_state.report_path = None
-            st.session_state.supabase_session_id = None
-
-            if supabase_enabled():
-                try:
-                    create_session_record()
-                except Exception as exc:
-                    st.warning(f"New cloud session could not be created after reset: {exc}")
-
-            try:
-                if os.path.exists(PERSIST_PATH):
-                    os.remove(PERSIST_PATH)
-            except Exception:
-                pass
-            st.rerun()
+        if st.session_state.get("session_finished", False):
+            st.caption("This five-day run is complete. Use GO LIVE to open the completion panel and start the next run.")
+        else:
+            st.button(
+                "NEW SESSION UNLOCKS AFTER DAY 5",
+                use_container_width=True,
+                key="btn_session_locked_until_day5",
+                disabled=True,
+            )
+            st.caption(
+                "Your Student ID remains linked to this run until the five trading days finish. "
+                "If you leave and return, the same unfinished session is restored."
+            )
         st.markdown('</div>', unsafe_allow_html=True)
 
     # ==================== RIGHT PANEL ====================
@@ -3955,49 +4129,55 @@ def main():
                 key="reflection_input",
             )
 
-            # Finish & Report
-            st.markdown('<div class="section-title">Finish Session & Report</div>', unsafe_allow_html=True)
-            if not st.session_state.session_finished:
-                if st.button("Finish Session & Generate PDF Report", use_container_width=True, type="primary", key="btn_finish"):
-                    cancel_pending_order_records(st.session_state.get("pending_limits", []), "finish_session")
-                    st.session_state.pending_limits = []
-                    # Close every remaining open trade at the current simulated market mark.
-                    # Using the tradebook avoids missing offsetting trades whose net position is zero.
-                    if any(t.get("status") == "Open" for t in st.session_state.get("tradebook", [])):
-                        _close_all_open_trades_at_market(
-                            current_price, current_dt, chain_df, "finish_session"
-                        )
-                    with st.spinner("Generating PDF..."):
+            # Report access.
+            st.markdown('<div class="section-title">Session Report</div>', unsafe_allow_html=True)
+
+            if not st.session_state.get("session_finished", False):
+                st.info(
+                    "This 5-day session is still active. Generating a PDF does not end or reset the market."
+                )
+                if st.button(
+                    "Generate Current PDF Snapshot",
+                    use_container_width=True,
+                    type="primary",
+                    key="btn_pdf_snapshot",
+                ):
+                    with st.spinner("Generating PDF snapshot..."):
                         path, fname = generate_pdf_report()
                         st.session_state.report_path = path
                         st.session_state.report_generated = True
-                        st.session_state.session_finished = True
-                        st.session_state.trading_locked = True
-
-                        if supabase_enabled():
-                            try:
-                                finish_session_record(
-                                    current_price=current_price,
-                                    current_day_num=current_day_num,
-                                    status="completed"
-                                )
-                                upload_report_record(path, fname)
-                            except Exception as exc:
-                                st.warning(f"PDF generated locally, but cloud report backup failed: {exc}")
-
+                        st.session_state.report_filename = fname
                         save_session_state()
-                        st.success(f"Report generated: {fname}")
-                        if os.path.exists(path):
-                            with open(path, "rb") as f:
-                                st.download_button("Download PDF Report", f, file_name=fname, mime="application/pdf")
-                    st.rerun()
-            else:
-                st.success("Session finished. Report available.")
-                if st.session_state.report_path and os.path.exists(st.session_state.report_path):
+                        st.success(f"PDF snapshot generated: {fname}")
+
+                if st.session_state.get("report_path") and os.path.exists(st.session_state.report_path):
                     with open(st.session_state.report_path, "rb") as f:
-                        st.download_button("Download PDF Report", f,
-                                           file_name=os.path.basename(st.session_state.report_path),
-                                           mime="application/pdf")
+                        st.download_button(
+                            "Download Current PDF Snapshot",
+                            f,
+                            file_name=os.path.basename(st.session_state.report_path),
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key="download_active_pdf_snapshot",
+                        )
+            else:
+                st.success(
+                    "The five-day session is complete. The final PDF has been frozen for this independent run."
+                )
+                st.warning(
+                    "Download the final PDF before starting the next session. "
+                    "The current local report may no longer be available after a new run or app redeployment."
+                )
+                if st.session_state.get("report_path") and os.path.exists(st.session_state.report_path):
+                    with open(st.session_state.report_path, "rb") as f:
+                        st.download_button(
+                            "Download Final Session PDF",
+                            f,
+                            file_name=os.path.basename(st.session_state.report_path),
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key="download_final_session_pdf_tab",
+                        )
 
         # ---------- TAB 5: LEADERBOARD ----------
         with tab_leaderboard:
@@ -4006,9 +4186,9 @@ def main():
                 unsafe_allow_html=True
             )
             st.caption(
-                "Each market run is treated independently. A student's sessions are never added together. "
-                "The leaderboard uses that student's highest realized P&L from any session, including an active "
-                "session once at least one trade has been closed."
+                "Within each 5-day market run, realized P&L accumulates across all closed trades. "
+                "When a new 5-day run starts, its P&L begins again from zero. Sessions are never added together: "
+                "each student's leaderboard score is the highest realized P&L from any one independent session."
             )
 
             def _draw_leaderboard():
@@ -4109,12 +4289,13 @@ def main():
 
     elif st.session_state.current_index >= n_bars - 1:
         st.session_state.playing = False
-        if any(t.get("status") == "Open" for t in st.session_state.get("tradebook", [])) \
-                and not st.session_state.trading_locked:
-            _settle_all_cash(current_price, current_dt)
-        st.session_state.pending_limits = []
-        st.session_state.trading_locked = True
-        save_session_state()
+        if not st.session_state.get("session_finished", False):
+            _finalize_five_day_session(
+                current_price=current_price,
+                current_dt=current_dt,
+                current_day_num=current_day_num,
+                chain_df=chain_df,
+            )
 
 if __name__ == "__main__":
     main()
