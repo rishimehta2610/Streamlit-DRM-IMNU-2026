@@ -14,7 +14,9 @@ import random
 import io
 from fpdf import FPDF
 import base64
+import uuid
 import streamlit.components.v1 as components
+from supabase import create_client
 
 # ============ PAGE CONFIG ============
 st.set_page_config(
@@ -23,6 +25,307 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed"
 )
+
+# ==========================================================
+# SUPABASE PERSISTENCE LAYER
+# ==========================================================
+APP_VERSION = "v1.0"
+SUPABASE_REPORT_BUCKET = "session-reports"
+
+@st.cache_resource
+def get_supabase():
+    """Create one server-side Supabase client from Streamlit Secrets."""
+    try:
+        return create_client(
+            st.secrets["supabase"]["url"],
+            st.secrets["supabase"]["key"]
+        )
+    except Exception:
+        return None
+
+supabase = get_supabase()
+
+def supabase_enabled():
+    return supabase is not None
+
+def _iso(value):
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
+
+def _sb_data(response):
+    data = getattr(response, "data", None)
+    return data if data is not None else []
+
+def test_supabase_connection():
+    """Lightweight end-to-end check against the participants table."""
+    if not supabase_enabled():
+        return False, "Supabase secrets/client are unavailable."
+    try:
+        supabase.table("participants").select("id").limit(1).execute()
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+def create_or_get_participant(student_name, student_id, email=""):
+    """Return a participant UUID, reusing an existing student_id/email where possible."""
+    if not supabase_enabled():
+        return None
+    student_name = (student_name or "").strip()
+    student_id = (student_id or "").strip()
+    email = (email or "").strip().lower()
+
+    # Prefer college/student ID as the stable identity key.
+    if student_id:
+        resp = (
+            supabase.table("participants")
+            .select("id,student_name,student_id,email")
+            .eq("student_id", student_id)
+            .limit(1)
+            .execute()
+        )
+        rows = _sb_data(resp)
+        if rows:
+            pid = rows[0]["id"]
+            updates = {"student_name": student_name}
+            if email:
+                updates["email"] = email
+            try:
+                supabase.table("participants").update(updates).eq("id", pid).execute()
+            except Exception:
+                pass
+            return pid
+
+    if email:
+        resp = (
+            supabase.table("participants")
+            .select("id,student_name,student_id,email")
+            .eq("email", email)
+            .limit(1)
+            .execute()
+        )
+        rows = _sb_data(resp)
+        if rows:
+            pid = rows[0]["id"]
+            updates = {"student_name": student_name}
+            if student_id:
+                updates["student_id"] = student_id
+            try:
+                supabase.table("participants").update(updates).eq("id", pid).execute()
+            except Exception:
+                pass
+            return pid
+
+    payload = {
+        "student_name": student_name,
+        "student_id": student_id or None,
+        "email": email or None,
+    }
+    resp = supabase.table("participants").insert(payload).select("id").execute()
+    rows = _sb_data(resp)
+    return rows[0]["id"] if rows else None
+
+def create_session_record():
+    """Create a Supabase session after the simulator price path has been initialized."""
+    if not supabase_enabled() or not st.session_state.get("participant_id"):
+        return None
+    payload = {
+        "participant_id": st.session_state.participant_id,
+        "app_version": APP_VERSION,
+        "status": "active",
+        "data_source": st.session_state.get("data_source_choice") or "garch",
+        "target_open_price": float(st.session_state.get("target_nifty_level", DEFAULT_OPEN_PRICE)),
+        "scale_factor": float(st.session_state.get("scale_factor", 1.0)),
+        "simulation_start": _iso(st.session_state.get("start_time")),
+        "simulation_end": _iso(st.session_state.get("session_end")),
+        "expiry_at": _iso(st.session_state.get("expiry_dt")),
+        "lot_size": int(st.session_state.get("lot_size", 65)),
+        "starting_capital": float(st.session_state.get("starting_capital", 10000000.0)),
+    }
+    resp = supabase.table("sessions").insert(payload).select("id").execute()
+    rows = _sb_data(resp)
+    sid = rows[0]["id"] if rows else None
+    st.session_state.supabase_session_id = sid
+    return sid
+
+def ensure_session_record():
+    """Make sure the current browser trading session has a database session row."""
+    if st.session_state.get("supabase_session_id"):
+        return st.session_state.supabase_session_id
+    return create_session_record()
+
+def save_order_record(item, status, current_dt=None, current_price=None,
+                      fill_price=None, rejection_reason=None):
+    if not supabase_enabled() or not st.session_state.get("supabase_session_id"):
+        return None
+    payload = {
+        "session_id": st.session_state.supabase_session_id,
+        "order_group_id": item.get("order_group_id"),
+        "strategy_name": item.get("strategy_name"),
+        "order_source": item.get("order_source", "manual"),
+        "executed_at": _iso(current_dt) if status == "filled" else None,
+        "side": item["side"],
+        "instrument_type": item["type"],
+        "strike": None if item["type"] == "FUT" else float(item.get("strike", 0)),
+        "lots": int(item.get("lots", 1)),
+        "quantity": int(item.get("quantity", 0)),
+        "order_type": item.get("order_type", "MARKET"),
+        "requested_price": float(item.get("price", 0.0)),
+        "ltp_at_order": float(item.get("ltp", item.get("price", 0.0))),
+        "spot_at_order": float(current_price) if current_price is not None else None,
+        "fill_price": float(fill_price) if fill_price is not None else None,
+        "status": status,
+        "rejection_reason": rejection_reason,
+    }
+    resp = supabase.table("orders").insert(payload).select("id").execute()
+    rows = _sb_data(resp)
+    return rows[0]["id"] if rows else None
+
+def update_order_record(order_id, **fields):
+    if not supabase_enabled() or not order_id:
+        return
+    clean = {k: v for k, v in fields.items() if v is not None}
+    if clean:
+        supabase.table("orders").update(clean).eq("id", order_id).execute()
+
+def cancel_pending_order_records(items, reason="cancelled"):
+    """Close database order rows when local pending limits are cancelled."""
+    if not supabase_enabled():
+        return
+    for item in list(items or []):
+        order_id = item.get("supabase_order_id")
+        if not order_id:
+            continue
+        try:
+            update_order_record(
+                order_id,
+                status="cancelled",
+                cancelled_at=datetime.now().isoformat(),
+                rejection_reason=reason
+            )
+        except Exception:
+            pass
+
+def save_trade_record(item, current_dt, order_id=None):
+    if not supabase_enabled() or not st.session_state.get("supabase_session_id"):
+        return None
+    payload = {
+        "session_id": st.session_state.supabase_session_id,
+        "order_id": order_id,
+        "entry_at": _iso(current_dt),
+        "instrument_type": item["type"],
+        "strike": None if item["type"] == "FUT" else float(item.get("strike", 0)),
+        "side": item["side"],
+        "lots": int(item.get("lots", 1)),
+        "quantity": int(item.get("quantity", 0)),
+        "entry_price": float(item.get("price", 0.0)),
+        "pnl": 0.0,
+        "status": "Open",
+    }
+    resp = supabase.table("trades").insert(payload).select("id").execute()
+    rows = _sb_data(resp)
+    return rows[0]["id"] if rows else None
+
+def close_trade_record(tradebook_row, current_dt, exit_price, exit_reason):
+    """Mirror a locally-closed trade into Supabase."""
+    trade_id = tradebook_row.get("supabase_trade_id")
+    if not supabase_enabled() or not trade_id:
+        return
+    payload = {
+        "exit_at": _iso(current_dt),
+        "exit_price": float(exit_price),
+        "pnl": float(tradebook_row.get("pnl", 0.0)),
+        "status": "Closed",
+        "exit_reason": exit_reason,
+    }
+    supabase.table("trades").update(payload).eq("id", trade_id).execute()
+
+def finish_session_record(current_price=None, current_day_num=None, status="completed"):
+    """Persist the final session KPIs without deleting historical records."""
+    sid = st.session_state.get("supabase_session_id")
+    if not supabase_enabled() or not sid:
+        return
+
+    closed = [t for t in st.session_state.get("tradebook", []) if t.get("status") == "Closed"]
+    wins = sum(1 for t in closed if float(t.get("pnl", 0)) > 0)
+    losses = sum(1 for t in closed if float(t.get("pnl", 0)) < 0)
+    realized = float(st.session_state.get("realized_pnl", 0.0))
+
+    # At formal completion all positions are closed; for reset/abandonment keep a mark-to-market snapshot if available.
+    open_pnl = 0.0
+    if st.session_state.get("positions") and current_price is not None and st.session_state.get("chain_df") is not None:
+        try:
+            cons = consolidate_positions(
+                st.session_state.positions,
+                current_price,
+                st.session_state.get("T_current", TOTAL_EXPIRY_DAYS / 365),
+                st.session_state.chain_df
+            )
+            open_pnl = float(sum(p["pnl"] for p in cons))
+        except Exception:
+            open_pnl = 0.0
+
+    total_pnl = realized + open_pnl
+    peak_margin = float(st.session_state.get("peak_margin_used", 0.0))
+    payload = {
+        "status": status,
+        "ended_at": datetime.now().isoformat(),
+        "ending_equity": float(st.session_state.get("starting_capital", 10000000.0)) + total_pnl,
+        "realized_pnl": realized,
+        "open_pnl": open_pnl,
+        "total_pnl": total_pnl,
+        "peak_margin_used": peak_margin,
+        "return_on_margin_pct": (total_pnl / peak_margin * 100.0) if peak_margin > 0 else 0.0,
+        "total_trades": len(st.session_state.get("tradebook", [])),
+        "closed_trades": len(closed),
+        "winning_trades": wins,
+        "losing_trades": losses,
+        "win_rate_pct": (wins / len(closed) * 100.0) if closed else 0.0,
+        "final_nifty_price": float(current_price) if current_price is not None else None,
+        "final_trading_day": int(current_day_num) if current_day_num is not None else None,
+        "max_reached_index": int(st.session_state.get("max_reached_index", 0)),
+        "trading_locked": bool(st.session_state.get("trading_locked", False)),
+        "session_finished": bool(st.session_state.get("session_finished", False)),
+        "report_generated": bool(st.session_state.get("report_generated", False)),
+    }
+    supabase.table("sessions").update(payload).eq("id", sid).execute()
+
+def upload_report_record(filepath, filename):
+    """Upload the PDF to the private session-reports bucket and save report metadata."""
+    sid = st.session_state.get("supabase_session_id")
+    if not supabase_enabled() or not sid or not filepath or not os.path.exists(filepath):
+        return None
+
+    storage_path = f"{sid}/{filename}"
+    with open(filepath, "rb") as f:
+        supabase.storage.from_(SUPABASE_REPORT_BUCKET).upload(
+            path=storage_path,
+            file=f,
+            file_options={
+                "content-type": "application/pdf",
+                "cache-control": "3600",
+                "upsert": "false",
+            },
+        )
+
+    payload = {
+        "session_id": sid,
+        "file_name": filename,
+        "storage_path": storage_path,
+        "mime_type": "application/pdf",
+        "file_size_bytes": os.path.getsize(filepath),
+        "report_version": "1.0",
+    }
+    supabase.table("reports").insert(payload).execute()
+    return storage_path
+
+# ==========================================================
+# END SUPABASE PERSISTENCE LAYER
+# ==========================================================
 
 # ============ GLOBAL CSS ============
 APP_CSS = """
@@ -572,6 +875,11 @@ defaults = {
     'session_start_wall': None,
     'data_source_choice': None,   # 'upload' | 'path' | 'garch'
     'day_close_map': {},          # day_num -> previous day's close for change calc
+    'participant_id': None,
+    'student_name': '',
+    'student_id': '',
+    'student_email': '',
+    'supabase_session_id': None,
 }
 
 for k, v in defaults.items():
@@ -1278,7 +1586,13 @@ def _json_serial(obj):
 
 
 def save_session_state():
-    """Persist key trading state so a browser refresh does not wipe the session."""
+    """Persist locally only when Supabase is unavailable.
+
+    A single filesystem JSON on Streamlit Community Cloud would be shared across users,
+    so it is intentionally disabled when the cloud database is configured.
+    """
+    if supabase_enabled():
+        return
     keys = [
         'current_index', 'playing', 'speed', 'basket', 'positions', 'tradebook',
         'pending_limits', 'realized_pnl', 'max_reached_index', 'data_loaded',
@@ -1314,7 +1628,9 @@ def save_session_state():
 
 
 def load_session_state():
-    """Restore previously saved session if available."""
+    """Restore local state only in non-Supabase/local-development mode."""
+    if supabase_enabled():
+        return False
     if not os.path.exists(PERSIST_PATH):
         return False
     try:
@@ -1510,6 +1826,10 @@ def _settle_all_cash(spot, current_dt):
                 sign = 1 if t['side'] == 'Buy' else -1
                 t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
                 t['status'] = 'Closed'
+                try:
+                    close_trade_record(t, current_dt, t['exit_price'], "expiry_or_week_end")
+                except Exception:
+                    pass
                 realized_add += t['pnl']
                 break
     st.session_state.realized_pnl += realized_add
@@ -1553,17 +1873,41 @@ def match_pending_limits(current_price, current_dt, chain_df, lot_size):
             'quantity': item['quantity'],
             'lots': item['lots']
         })
+
+        order_id = item.get('supabase_order_id')
+        trade_id = None
+        if supabase_enabled():
+            try:
+                if order_id:
+                    update_order_record(
+                        order_id,
+                        status="filled",
+                        executed_at=_iso(current_dt),
+                        fill_price=float(item['price'])
+                    )
+                else:
+                    order_id = save_order_record(
+                        item, "filled", current_dt=current_dt,
+                        current_price=current_price, fill_price=item['price']
+                    )
+                trade_id = save_trade_record(item, current_dt, order_id)
+            except Exception:
+                pass
+
         st.session_state.tradebook.append({
             'entry_time': current_dt.strftime('%H:%M:%S'),
             'strike': item['strike'],
             'type': item['type'],
             'side': item['side'],
             'qty': item['quantity'],
+            'lots': item['lots'],
             'entry_price': item['price'],
             'exit_time': '-',
             'exit_price': 0.0,
             'pnl': 0.0,
-            'status': 'Open'
+            'status': 'Open',
+            'supabase_order_id': order_id,
+            'supabase_trade_id': trade_id
         })
         filled += 1
     st.session_state.pending_limits = still_pending
@@ -1603,6 +1947,51 @@ def main():
         real broker, exchange, or live market.
     </div>
     """, unsafe_allow_html=True)
+
+    # ===== STUDENT IDENTIFICATION / CLOUD SESSION OWNERSHIP =====
+    if supabase_enabled() and not st.session_state.get("participant_id"):
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        st.markdown("### Student Identification")
+        st.caption(
+            "Your simulator session, orders, trades, performance summary and final report "
+            "will be recorded for academic/classroom use."
+        )
+        with st.form("student_identity_form", clear_on_submit=False):
+            student_name = st.text_input("Full name *", value=st.session_state.get("student_name", ""))
+            student_id = st.text_input("Student ID *", value=st.session_state.get("student_id", ""))
+            student_email = st.text_input("Email (optional)", value=st.session_state.get("student_email", ""))
+            consent = st.checkbox(
+                "I understand that my simulator activity will be stored for classroom/academic review."
+            )
+            submitted = st.form_submit_button("Continue to Simulator", type="primary", use_container_width=True)
+
+        if submitted:
+            if not student_name.strip() or not student_id.strip():
+                st.error("Please enter both your full name and Student ID.")
+            elif student_email.strip() and "@" not in student_email:
+                st.error("Please enter a valid email address or leave the email field blank.")
+            elif not consent:
+                st.error("Please confirm the session-recording notice to continue.")
+            else:
+                try:
+                    pid = create_or_get_participant(student_name, student_id, student_email)
+                    if not pid:
+                        raise RuntimeError("Supabase did not return a participant ID.")
+                    st.session_state.participant_id = pid
+                    st.session_state.student_name = student_name.strip()
+                    st.session_state.student_id = student_id.strip()
+                    st.session_state.student_email = student_email.strip().lower()
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Could not register the student in Supabase: {exc}")
+        st.markdown('</div>', unsafe_allow_html=True)
+        return
+    elif not supabase_enabled():
+        st.warning(
+            "Cloud session logging is currently unavailable because Supabase credentials "
+            "could not be loaded. The simulator can still run locally, but this session "
+            "will not be stored centrally."
+        )
 
     lot_size = st.session_state.lot_size
 
@@ -1707,7 +2096,21 @@ def main():
             st.session_state.max_reached_index = 0
             st.session_state.data_loaded = True
             st.session_state.session_start_wall = datetime.now()
+            st.session_state.target_nifty_level = float(open_price_input)
             st.session_state.basket = []
+
+            # Create the permanent cloud session only after the market path is ready.
+            if supabase_enabled():
+                try:
+                    st.session_state.supabase_session_id = None
+                    sid = create_session_record()
+                    if not sid:
+                        raise RuntimeError("Supabase did not return a session ID.")
+                except Exception as exc:
+                    st.session_state.data_loaded = False
+                    st.error(f"Could not start the recorded Supabase session: {exc}")
+                    return
+
             save_session_state()
             st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
@@ -1768,6 +2171,7 @@ def main():
         if st.session_state.positions and not st.session_state.trading_locked:
             _settle_all_cash(current_price, current_dt)
             st.toast("Session week complete — all open positions cash-settled", icon="📅")
+        cancel_pending_order_records(st.session_state.pending_limits, "week_end")
         st.session_state.pending_limits = []  # cancel unfilled limits at week end
         st.session_state.trading_locked = True
 
@@ -1927,11 +2331,25 @@ def main():
         # Reset high-contrast
         st.markdown('<div class="reset-btn-container">', unsafe_allow_html=True)
         if st.button("🔄 RESET SESSION", use_container_width=True, key="btn_reset"):
+            # Close the current database session as a reset/abandoned run before starting a fresh one.
+            if supabase_enabled() and st.session_state.get("supabase_session_id"):
+                try:
+                    finish_session_record(
+                        current_price=current_price,
+                        current_day_num=current_day_num,
+                        status="reset"
+                    )
+                except Exception:
+                    pass
+
+            cancel_pending_order_records(st.session_state.get("pending_limits", []), "session_reset")
+
             for key in list(st.session_state.keys()):
                 if key not in ['data_loaded', 'df_raw', 'simulated_data', 'df_day_scaled',
                                'start_time', 'session_end', 'expiry_dt', 'scale_factor', 'prev_scaled_close',
                                'prev_day_close', 'lot_size', 'target_nifty_level', 'starting_capital',
-                               'data_source_choice', 'day_close_map']:
+                               'data_source_choice', 'day_close_map',
+                               'participant_id', 'student_name', 'student_id', 'student_email']:
                     del st.session_state[key]
             st.session_state.playing = False
             st.session_state.current_index = 0
@@ -1944,6 +2362,16 @@ def main():
             st.session_state.peak_margin_used = 0.0
             st.session_state.trading_locked = False
             st.session_state.session_finished = False
+            st.session_state.report_generated = False
+            st.session_state.report_path = None
+            st.session_state.supabase_session_id = None
+
+            if supabase_enabled():
+                try:
+                    create_session_record()
+                except Exception as exc:
+                    st.warning(f"New cloud session could not be created after reset: {exc}")
+
             try:
                 if os.path.exists(PERSIST_PATH):
                     os.remove(PERSIST_PATH)
@@ -2068,7 +2496,8 @@ def main():
                     'quantity': qty,
                     'price': px,
                     'order_type': order_type,
-                    'ltp': ltp
+                    'ltp': ltp,
+                    'order_source': 'manual'
                 }
 
             def _can_afford(extra_items):
@@ -2077,13 +2506,26 @@ def main():
                 return req <= st.session_state.starting_capital, req
 
             def _execute_items(items):
-                """Execute marketable orders; queue non-marketable limits. Returns count executed."""
+                """Execute marketable orders; queue non-marketable limits; mirror all order events to Supabase."""
                 if st.session_state.trading_locked:
                     st.error("Trading is locked for this session.")
                     return 0
+
                 ok, req = _can_afford(items)
                 if not ok:
                     shortfall = req - st.session_state.starting_capital
+                    if supabase_enabled():
+                        for item in items:
+                            try:
+                                save_order_record(
+                                    item,
+                                    "rejected",
+                                    current_dt=current_dt,
+                                    current_price=current_price,
+                                    rejection_reason=f"Insufficient margin; shortfall {shortfall:.2f}"
+                                )
+                            except Exception:
+                                pass
                     st.markdown(f"""
                     <div class="margin-err-box">
                         <b>⚠️ Insufficient margin — order not placed.</b><br>
@@ -2096,14 +2538,35 @@ def main():
                     </div>
                     """, unsafe_allow_html=True)
                     return 0
+
                 executed = 0
                 for item in items:
                     if item['order_type'] == "LIMIT":
                         marketable = (item['side'] == 'Buy' and item['price'] >= item['ltp']) or \
                                      (item['side'] == 'Sell' and item['price'] <= item['ltp'])
                         if not marketable:
+                            if supabase_enabled():
+                                try:
+                                    item['supabase_order_id'] = save_order_record(
+                                        item, "pending", current_dt=current_dt, current_price=current_price
+                                    )
+                                except Exception:
+                                    item['supabase_order_id'] = None
                             st.session_state.pending_limits.append(item)
                             continue
+
+                    order_id = None
+                    trade_id = None
+                    if supabase_enabled():
+                        try:
+                            order_id = save_order_record(
+                                item, "filled", current_dt=current_dt,
+                                current_price=current_price, fill_price=item['price']
+                            )
+                            trade_id = save_trade_record(item, current_dt, order_id)
+                        except Exception:
+                            pass
+
                     st.session_state.positions.append({
                         'strike': item['strike'],
                         'type': item['type'],
@@ -2118,13 +2581,17 @@ def main():
                         'type': item['type'],
                         'side': item['side'],
                         'qty': item['quantity'],
+                        'lots': item['lots'],
                         'entry_price': item['price'],
                         'exit_time': '-',
                         'exit_price': 0.0,
                         'pnl': 0.0,
-                        'status': 'Open'
+                        'status': 'Open',
+                        'supabase_order_id': order_id,
+                        'supabase_trade_id': trade_id
                     })
                     executed += 1
+
                 margin_now = calculate_realistic_margin(st.session_state.positions, current_price, lot_size)
                 if margin_now > st.session_state.peak_margin_used:
                     st.session_state.peak_margin_used = margin_now
@@ -2151,7 +2618,9 @@ def main():
             with btn1:
                 if st.button("Add to Basket", key="btn_add_basket", type="secondary", use_container_width=True,
                              disabled=st.session_state.trading_locked):
-                    st.session_state.basket.append(_build_order_item())
+                    basket_item = _build_order_item()
+                    basket_item['order_source'] = 'basket'
+                    st.session_state.basket.append(basket_item)
                     st.toast(f"Added {side} {strike} {otype} x{lots} to basket", icon="✅")
                     st.rerun()
             with btn2:
@@ -2259,6 +2728,11 @@ def main():
 
             if st.button("➕ Add Strategy to Basket", key="btn_add_strategy", type="secondary",
                          use_container_width=True, disabled=st.session_state.trading_locked):
+                group_id = str(uuid.uuid4())
+                for strategy_item in strat_items:
+                    strategy_item['order_source'] = 'strategy'
+                    strategy_item['strategy_name'] = strat_name
+                    strategy_item['order_group_id'] = group_id
                 st.session_state.basket.extend(strat_items)
                 st.toast(f"Added {strat_name.split('(')[0].strip()} ({len(strat_items)} legs) to basket", icon="🧩")
                 st.rerun()
@@ -2459,6 +2933,10 @@ def main():
                                             sign = 1 if t['side'] == 'Buy' else -1
                                             t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
                                             t['status'] = 'Closed'
+                                            try:
+                                                close_trade_record(t, current_dt, t['exit_price'], "manual")
+                                            except Exception:
+                                                pass
                                             realized_add += t['pnl']
                                             break
                                     to_remove.append(i)
@@ -2481,6 +2959,10 @@ def main():
                                 sign = 1 if t['side'] == 'Buy' else -1
                                 t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
                                 t['status'] = 'Closed'
+                                try:
+                                    close_trade_record(t, current_dt, t['exit_price'], "manual_exit_all")
+                                except Exception:
+                                    pass
                                 realized_add += t['pnl']
                     st.session_state.positions = []
                     st.session_state.realized_pnl += realized_add
@@ -2661,6 +3143,8 @@ def main():
             st.markdown('<div class="section-title">Finish Session & Report</div>', unsafe_allow_html=True)
             if not st.session_state.session_finished:
                 if st.button("🏁 Finish Session & Generate PDF Report", use_container_width=True, type="primary", key="btn_finish"):
+                    cancel_pending_order_records(st.session_state.get("pending_limits", []), "finish_session")
+                    st.session_state.pending_limits = []
                     # Close remaining
                     if st.session_state.positions:
                         for pos in cons_pos:
@@ -2671,6 +3155,10 @@ def main():
                                     sign = 1 if t['side'] == 'Buy' else -1
                                     t['pnl'] = sign * (t['exit_price'] - t['entry_price']) * t['qty']
                                     t['status'] = 'Closed'
+                                    try:
+                                        close_trade_record(t, current_dt, t['exit_price'], "finish_session")
+                                    except Exception:
+                                        pass
                                     st.session_state.realized_pnl += t['pnl']
                         st.session_state.positions = []
                     with st.spinner("Generating PDF..."):
@@ -2679,6 +3167,24 @@ def main():
                         st.session_state.report_generated = True
                         st.session_state.session_finished = True
                         st.session_state.trading_locked = True
+
+                        if supabase_enabled():
+                            try:
+                                finish_session_record(
+                                    current_price=current_price,
+                                    current_day_num=current_day_num,
+                                    status="completed"
+                                )
+                                upload_report_record(path, fname)
+                                # report_generated becomes fully true only after storage metadata is persisted
+                                supabase.table("sessions").update({
+                                    "report_generated": True,
+                                    "session_finished": True,
+                                    "trading_locked": True
+                                }).eq("id", st.session_state.supabase_session_id).execute()
+                            except Exception as exc:
+                                st.warning(f"PDF generated locally, but cloud report backup failed: {exc}")
+
                         save_session_state()
                         st.success(f"Report generated: {fname}")
                         if os.path.exists(path):
