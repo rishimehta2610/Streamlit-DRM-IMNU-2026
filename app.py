@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v2.6"
+APP_VERSION = "v3.0"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -537,6 +537,7 @@ def _progress_state_payload():
         "T_current", "starting_capital", "peak_margin_used", "session_start_wall",
         "data_source_choice", "day_close_map", "target_nifty_level", "strategy_focus",
         "equity_peak", "max_drawdown", "max_drawdown_pct", "reflection_note", "session_no",
+        "user_experience", "sim_mode", "active_challenge",
     ]
     state = {}
     for k in keys:
@@ -1243,6 +1244,39 @@ div[data-testid="stFormSubmitButton"] button p,
 div[data-testid="stFormSubmitButton"] button span { color: #ffffff !important; }
 div[data-testid="stFormSubmitButton"] button:hover { background: #123a60 !important; border-color: #123a60 !important; }
 
+
+/* ===== v3 merged learning/risk enhancements ===== */
+.cockpit-bar {
+    background: linear-gradient(90deg,#0a1628,#12263a);
+    border: 1px solid #1e3a5f;
+    border-radius: 10px;
+    padding: 9px 14px;
+    margin-bottom: 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 18px;
+    color: #e8f0fe;
+}
+.cockpit-item { display:flex; flex-direction:column; line-height:1.2; }
+.cockpit-label { font-size:9px; color:#8ea3c0; font-weight:700; text-transform:uppercase; letter-spacing:.4px; }
+.cockpit-val { font-size:14px; font-weight:700; font-variant-numeric:tabular-nums; }
+.cockpit-sep { width:1px; height:26px; background:#2a4463; }
+.risk-util-track { background:#eef1f5; border-radius:8px; height:14px; width:100%; overflow:hidden; margin:4px 0; }
+.risk-util-fill { height:100%; border-radius:8px 0 0 8px; transition:width .3s; }
+.risk-badge { display:inline-block; padding:3px 9px; border-radius:6px; font-size:11px; font-weight:700; }
+.risk-low { background:#e3f7ec; color:#0a7a4a; }
+.risk-moderate { background:#fff4d6; color:#8a6100; }
+.risk-high { background:#fde0dc; color:#b62f22; }
+.risk-critical { background:#fdd; color:#a3160c; }
+.risk-warn-box { border-radius:8px; padding:8px 12px; margin:6px 0; font-size:12px; font-weight:600; }
+.logic-tree-box { background:#12161f; border:1px solid #2a3040; border-radius:12px; padding:14px 16px; margin-bottom:12px; color:#eaeef5; }
+.logic-tree-title { font-size:11px; color:#8ea3c0; text-transform:uppercase; letter-spacing:.5px; margin-bottom:10px; }
+.logic-tree-row { display:flex; justify-content:center; flex-wrap:wrap; gap:20px; margin-top:6px; }
+.logic-tree-branch { text-align:center; font-size:11px; min-width:100px; }
+.logic-tree-branch .dir-label { color:#ffd166; font-weight:700; margin:2px 0; }
+.logic-tree-branch .leaf { color:#8ee4af; }
+
 </style>
 """
 
@@ -1296,6 +1330,9 @@ defaults = {
     'session_no': None,
     'strategy_focus': 'Open practice',
     'reflection_note': '',
+    'user_experience': 'Intermediate',
+    'sim_mode': 'Learning Mode',
+    'active_challenge': None,
     'equity_peak': 10000000.0,
     'max_drawdown': 0.0,
     'max_drawdown_pct': 0.0,
@@ -1851,6 +1888,77 @@ STRATEGY_CATALOGUE = {
     },
 }
 
+EDUCATIONAL_PROMPTS = {
+    ("BUY", "CE"): "You're buying a call. Remember: you need NIFTY to rise enough to overcome both the premium paid and time decay.",
+    ("BUY", "PE"): "You're buying a put. Remember: you need NIFTY to fall enough to overcome both the premium paid and time decay.",
+    ("SELL", "CE"): "You're selling a call. Time decay works for you, but a rising NIFTY works against you — losses are uncapped if the market moves too far up.",
+    ("SELL", "PE"): "You're selling a put. Time decay works for you, but a falling NIFTY works against you — losses can be large (though not unlimited) if the market falls too far.",
+}
+
+MISSION_CATALOGUE = [
+    {'id': 'learn_calls', 'title': 'Mission 1 — Learn Calls', 'icon': '📈',
+     'objective': "Make a profit using a long call (Buy a CE, and close it for a positive P&L)."},
+    {'id': 'learn_puts', 'title': 'Mission 2 — Learn Puts', 'icon': '📉',
+     'objective': "Profit from a falling market using a long put (Buy a PE, and close it for a positive P&L)."},
+    {'id': 'time_decay', 'title': 'Mission 3 — Time Decay', 'icon': '⏳',
+     'objective': "Hold both an ATM and an OTM option at the same time, so you can compare how their Theta differs."},
+    {'id': 'volatility', 'title': 'Mission 4 — Volatility', 'icon': '🌪️',
+     'objective': "Place a trade when the chain's IV is running hot (16%+ on the ATM strike) — trading into an IV spike."},
+    {'id': 'hedging', 'title': 'Mission 5 — Hedging', 'icon': '🛡️',
+     'objective': "Protect a futures position using options — execute a Protective Put or Protective Call from the Strategy Lab."},
+    {'id': 'strategy', 'title': 'Mission 6 — Strategy', 'icon': '🧩',
+     'objective': "Construct a Bull Call Spread from the Strategy Builder and execute it."},
+    {'id': 'risk', 'title': 'Mission 7 — Risk', 'icon': '⚖️',
+     'objective': "Finish the session with a positive total P&L while keeping peak margin utilization below 50% of capital."},
+]
+
+CHALLENGE_CATALOGUE = {
+    "Bullish Breakout": {
+        'capital': 1_000_000.0, 'profit_target': 25_000.0, 'max_drawdown': 15_000.0, 'max_trades': 5,
+        'blurb': "You expect NIFTY to break out higher. Trade with a bullish bias.",
+    },
+    "Steady Hand": {
+        'capital': 1_000_000.0, 'profit_target': 15_000.0, 'max_drawdown': 8_000.0, 'max_trades': 8,
+        'blurb': "Smaller profit target, tighter drawdown limit — rewards defined-risk, disciplined trading over big swings.",
+    },
+    "Risk Manager": {
+        'capital': 500_000.0, 'profit_target': 10_000.0, 'max_drawdown': 5_000.0, 'max_trades': 6,
+        'blurb': "Tight capital and a tight drawdown cap — margin discipline matters more than the profit target here.",
+    },
+}
+
+STRATEGY_VIEW_TAGS = {
+    "Protective Put  (Long Asset + Long ATM Put)": ["Bullish"],
+    "Protective Call  (Short Asset + Long ATM Call)": ["Bearish"],
+    "Covered Call Writing  (Long Asset + Short ATM Call)": ["Neutral", "Bullish"],
+    "Covered Put Writing  (Short Asset + Short ATM Put)": ["Neutral", "Bearish"],
+    "Bull Call Spread  (Long ATM Call + Short OTM Call)": ["Bullish"],
+    "Bear Put Spread  (Long ATM Put + Short OTM Put)": ["Bearish"],
+    "Bear Call Spread  (Short ATM Call + Long OTM Call)": ["Bearish"],
+    "Bull Put Spread  (Short ATM Put + Long OTM Put)": ["Bullish"],
+    "Short Box Spread  (Short ATM Call + Long OTM Call + Short ATM Put + Long OTM Put)": ["Neutral"],
+    "Long Box Spread  (Long ATM Call + Short OTM Call + Long ATM Put + Short OTM Put)": ["Neutral"],
+    "Long Butterfly — Call  (Buy Lower + Sell 2x ATM + Buy Upper)": ["Neutral"],
+    "Short Butterfly — Call  (Sell Lower + Buy 2x ATM + Sell Upper)": ["Volatile"],
+    "Long Butterfly — Put  (Buy Lower + Sell 2x ATM + Buy Upper)": ["Neutral"],
+    "Short Butterfly — Put  (Sell Lower + Buy 2x ATM + Sell Upper)": ["Volatile"],
+    "Long Straddle  (Long ATM Call + Long ATM Put)": ["Volatile"],
+    "Short Straddle  (Short ATM Call + Short ATM Put)": ["Neutral"],
+    "Long Strangle  (Long OTM Call + Long OTM Put)": ["Volatile"],
+    "Short Strangle  (Short OTM Call + Short OTM Put)": ["Neutral"],
+    "Long Strip  (Long ATM Call + Long 2x ATM Put)": ["Volatile", "Bearish"],
+    "Short Strip  (Short ATM Call + Short 2x ATM Put)": ["Neutral", "Bearish"],
+    "Long Strap  (Long 2x ATM Call + Long ATM Put)": ["Volatile", "Bullish"],
+    "Short Strap  (Short 2x ATM Call + Short ATM Put)": ["Neutral", "Bullish"],
+}
+
+MARKET_VIEW_BLURBS = {
+    "Bullish": "You expect NIFTY to rise. Strategies here profit as spot moves up.",
+    "Bearish": "You expect NIFTY to fall. Strategies here profit as spot moves down.",
+    "Neutral": "You expect NIFTY to stay roughly where it is, or move slowly. Strategies here profit from low movement or time decay.",
+    "Volatile": "You expect a big move but aren't sure which direction. Strategies here profit from a large move either way.",
+}
+
 def compute_position_greeks(positions, spot, T, r=0.068, q=0.014):
     net = {'delta': 0.0, 'gamma': 0.0, 'theta': 0.0, 'vega': 0.0}
     for pos in positions:
@@ -2162,6 +2270,393 @@ def summarize_hold_vs_exit(hold_table):
             f"which way the market moved after you exited, so use this to reflect on your own exits, "
             f"not as a signal to always hold longer.")
 
+
+def get_strategy_iv_preference(items):
+    """Classifies a strategy as favouring High IV or Low IV based on its own net OPTION
+    premium (FUT leg cost excluded, since IV only affects option pricing): a net premium
+    PAID (debit) is cheaper to enter when IV -- and therefore option prices -- are low;
+    a net premium RECEIVED (credit) collects more when IV is high. Computed dynamically
+    from the live pricing model rather than hardcoded, so it stays consistent with
+    whatever the model actually prices each leg at right now."""
+    net = sum(
+        (it['price'] * it['quantity']) * (1 if it['side'] == 'Buy' else -1)
+        for it in items if it['type'] in ('CE', 'PE')
+    )
+    if net > 1:
+        return "Low IV"   # net debit: cheaper to enter when IV is low
+    elif net < -1:
+        return "High IV"  # net credit: collects more premium when IV is high
+    return "Either"
+
+def hints_enabled():
+    """True in Learning Mode (or before a mode is chosen, for backward compatibility) --
+    False in Practice/Challenge Mode, which are deliberately lower-assistance. This
+    gates explanatory captions and tooltips, never functional data: Greeks values,
+    margin figures, and error messages always show regardless of mode, since hiding
+    those would make the app harder to use, not just less hand-holdy."""
+    return st.session_state.get('sim_mode') in (None, "Learning Mode")
+
+def estimate_probability_of_profit(items, spot, T, r=0.068, q=0.014):
+    """Risk-neutral probability the position finishes profitable at expiry, using the
+    same lognormal/BSM assumptions as the rest of the pricing model (spot follows
+    S_T = S0*exp((r-q-0.5sigma^2)T + sigma*sqrt(T)*Z)). Splits the spot axis into
+    regions between consecutive breakevens, checks the payoff's sign in each region,
+    and sums the risk-neutral probability of the profitable regions. A teaching
+    approximation (real-world/physical probabilities differ from risk-neutral ones),
+    labelled as such wherever it's shown."""
+    stats = analyze_payoff(items)
+    breakevens = sorted(stats['breakevens'])
+    option_strikes = [it['strike'] for it in items if it['type'] in ('CE', 'PE')]
+    if option_strikes:
+        ivs = [get_iv_surface(k, spot, T) / 100 for k in option_strikes]
+        sigma = max(sum(ivs) / len(ivs), 0.01)
+    else:
+        sigma = 0.15
+    T = max(T, 1e-6)
+
+    def prob_le(K):
+        if K <= 0:
+            return 0.0
+        d2 = (math.log(spot / K) + (r - q - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        return float(norm.cdf(-d2))
+
+    bounds = [0.0] + breakevens + [None]  # None marks +infinity
+    total_prob = 0.0
+    for i in range(len(bounds) - 1):
+        lo, hi = bounds[i], bounds[i + 1]
+        if hi is None:
+            test_point = max(lo * 1.05, lo + 500) if lo > 0 else spot + 500
+        elif lo == 0.0:
+            test_point = hi / 2 if hi > 0 else 1.0
+        else:
+            test_point = (lo + hi) / 2
+        payoff_at_test = _payoff_at_expiry(items, np.array([test_point]))[0]
+        if payoff_at_test > 0:
+            p_hi = 1.0 if hi is None else prob_le(hi)
+            p_lo = prob_le(lo) if lo > 0 else 0.0
+            total_prob += (p_hi - p_lo)
+    return max(0.0, min(1.0, total_prob))
+
+def compute_scenario_pnl(items, current_spot, T, r=0.068, q=0.014, step=200, n_each_side=3):
+    """Re-price each leg at hypothetical spot levels around current_spot, using the SAME
+    time-to-expiry and IV surface as right now (i.e. NOT at expiry) -- so this answers
+    'what would my P&L be today if NIFTY moved to X', reflecting delta/gamma at the
+    current T, distinct from the at-expiry payoff diagram. FUT legs reprice linearly."""
+    levels = [current_spot + step * i for i in range(-n_each_side, n_each_side + 1)]
+    rows = []
+    for lvl in levels:
+        total = 0.0
+        for it in items:
+            sign = 1 if it['side'] == 'Buy' else -1
+            qty = it.get('quantity', it.get('lots', 1))
+            entry = float(it.get('price', it.get('entry_price', 0)))
+            if it['type'] == 'FUT':
+                total += sign * (lvl - entry) * qty
+            else:
+                iv = get_iv_surface(it['strike'], lvl, T) / 100
+                opt = 'call' if it['type'] == 'CE' else 'put'
+                new_price, _, _, _, _ = calculate_option_price(lvl, it['strike'], T, r, q, iv, opt)
+                total += sign * (new_price - entry) * qty
+        rows.append((lvl, total))
+    return rows
+
+def render_payoff_slider(items, spot, key_prefix):
+    """Interactive 'what if NIFTY expires at X' slider under a payoff diagram --
+    reads the exact same analytical payoff function used for the chart itself,
+    so the number always matches the curve exactly, not an eyeballed read-off."""
+    option_strikes = [it['strike'] for it in items if it['type'] in ('CE', 'PE')]
+    anchor_points = option_strikes + [spot]
+    lo = max(0, min(anchor_points) - 1000)
+    hi = max(anchor_points) + 1000
+    default_val = float(round(spot / 50) * 50)
+    slider_val = st.slider(
+        "NIFTY at expiry", min_value=float(round(lo / 50) * 50), max_value=float(round(hi / 50) * 50),
+        value=default_val, step=50.0, key=f"payoff_slider_{key_prefix}"
+    )
+    pnl_at_slider = float(_payoff_at_expiry(items, np.array([slider_val]))[0])
+    pnl_color = "#00a86b" if pnl_at_slider >= 0 else "#e74c3c"
+    st.markdown(
+        f"<div style='text-align:center;padding:6px 0;'>"
+        f"If NIFTY expires at <b>₹{slider_val:,.0f}</b> → Estimated P&amp;L = "
+        f"<span style='color:{pnl_color};font-weight:700;font-size:16px;'>₹{pnl_at_slider:+,.0f}</span></div>",
+        unsafe_allow_html=True
+    )
+
+def render_equity_curve(analytics):
+    """Plotly equity curve (cumulative realized P&L by trade) with the max-drawdown
+    segment highlighted -- the single chart that gives the most immediate sense of
+    performance quality, per the assignment's own emphasis on this feature."""
+    x, y = analytics['equity_x'], analytics['equity_y']
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=x, y=y, mode='lines+markers', name='Realized Equity',
+        line=dict(color='#0a2540', width=2.5), marker=dict(size=5),
+        fill='tozeroy', fillcolor='rgba(10,37,64,0.06)',
+    ))
+    pi, ti = analytics['dd_peak_idx'], analytics['dd_trough_idx']
+    if analytics['max_drawdown'] > 0:
+        fig.add_trace(go.Scatter(
+            x=[pi, ti], y=[y[pi], y[ti]], mode='lines+markers', name='Max Drawdown',
+            line=dict(color='#e74c3c', width=3, dash='dot'),
+            marker=dict(size=8, color='#e74c3c', symbol='diamond'),
+        ))
+    fig.add_hline(y=0, line_dash="dash", line_color="#888", line_width=1)
+    fig.update_layout(
+        height=260, margin=dict(l=40, r=20, t=20, b=30),
+        xaxis_title="Trade # (in exit order)", yaxis_title="Cumulative Realized P&L (₹)",
+        plot_bgcolor='white', paper_bgcolor='white', showlegend=False,
+    )
+    fig.update_xaxes(showgrid=True, gridcolor='#eee', dtick=1)
+    fig.update_yaxes(showgrid=True, gridcolor='#eee', zeroline=False)
+    return fig
+
+def compute_trading_behaviour(tradebook, positions, peak_margin_used, starting_capital, session_days=SIM_DAYS):
+    """Factual, non-judgmental behaviour metrics for the PDF's 'Trading Behaviour' page --
+    describes what happened (frequency, sizing, margin usage) rather than diagnosing the
+    student, since we only see one session and can't infer intent or skill from it alone."""
+    closed = [t for t in tradebook if t['status'] == 'Closed']
+    all_trades = tradebook
+    n_total = len(all_trades)
+    n_closed = len(closed)
+    n_open = n_total - n_closed
+    lots_list = [t['qty'] for t in all_trades if t.get('qty')]
+    avg_lots = sum(lots_list) / len(lots_list) if lots_list else 0
+    max_lots = max(lots_list) if lots_list else 0
+    trades_per_day = n_total / max(session_days, 1)
+    margin_util_pct = (peak_margin_used / starting_capital * 100) if starting_capital > 0 else 0
+    unique_instruments = len(set((t['strike'], t['type']) for t in all_trades))
+    naked_shorts = len([t for t in all_trades if t['side'] == 'Sell'])
+    with_reason = len([t for t in all_trades if t.get('reason', '').strip()])
+    return {
+        'n_total': n_total, 'n_closed': n_closed, 'n_open': n_open,
+        'avg_lots': avg_lots, 'max_lots': max_lots, 'trades_per_day': trades_per_day,
+        'margin_util_pct': margin_util_pct, 'unique_instruments': unique_instruments,
+        'naked_shorts': naked_shorts, 'with_reason': with_reason,
+    }
+
+def generate_learning_summary(analytics, behaviour, positions):
+    """Rule-based (not AI-generated) '3 things done well / 3 to improve / 1 concept to
+    revisit' for the PDF's closing page. Every line is gated by a concrete condition on
+    numbers already computed this session, so the feedback is deterministic and reflects
+    what actually happened rather than a templated guess."""
+    good, improve = [], []
+
+    if analytics:
+        if analytics['profit_factor'] not in (0.0,) and analytics['profit_factor'] >= 1.5:
+            good.append(f"Profit factor of {analytics['profit_factor']:.2f} - winning trades outweighed losing trades in rupee terms.")
+        if analytics['max_win_streak'] >= 2:
+            good.append(f"You put together a {analytics['max_win_streak']}-trade winning streak without giving it back immediately.")
+        if analytics['max_loss_streak'] <= 2:
+            good.append("You never chained more than 2 losing trades in a row - losses didn't compound into a long losing streak.")
+        if analytics['sharpe_like'] is not None and analytics['sharpe_like'] > 0.3:
+            good.append("Your trade P&L was consistently more positive than volatile (a healthy mean-to-spread ratio across trades).")
+
+        if analytics['profit_factor'] < 1.0:
+            improve.append(f"Profit factor was {analytics['profit_factor']:.2f} (below 1.0) - rupee losses outweighed rupee wins; review position sizing on losing trades.")
+        if analytics['max_loss_streak'] >= 3:
+            improve.append(f"You had a {analytics['max_loss_streak']}-trade losing streak - consider a rule for pausing or reassessing after consecutive losses.")
+        if analytics['avg_holding_minutes'] is not None and analytics['avg_holding_minutes'] < BAR_MINUTES * 2:
+            improve.append("Average holding time was very short (near-immediate exits) - this doesn't give a position much room to reflect a market view.")
+        if analytics['max_drawdown'] > 0 and analytics['equity_y'][-1] > 0 and analytics['max_drawdown'] > 0.6 * max(analytics['equity_y']):
+            improve.append(f"Maximum drawdown (Rs {analytics['max_drawdown']:,.0f}) erased a large share of peak gains - consider tighter exit discipline after a position moves in your favour.")
+
+    if behaviour['margin_util_pct'] < 40:
+        good.append(f"Margin utilization peaked at {behaviour['margin_util_pct']:.0f}% of capital - you kept comfortable headroom.")
+    else:
+        improve.append(f"Margin utilization peaked at {behaviour['margin_util_pct']:.0f}% of capital - a large share of your capacity was tied up, leaving less room to react.")
+
+    if behaviour['unique_instruments'] >= 3:
+        good.append(f"You traded {behaviour['unique_instruments']} different strikes/instruments rather than repeating the same single trade.")
+
+    if behaviour['with_reason'] >= max(1, behaviour['n_total'] // 2):
+        good.append("You recorded a rationale for most of your trades - a habit that makes reviewing your own decisions much easier.")
+    elif behaviour['n_total'] > 0:
+        improve.append("Most trades didn't have a recorded rationale - noting *why* you're entering a trade makes it much easier to review later whether your reasoning held up.")
+
+    if behaviour['naked_shorts'] > 0 and behaviour['naked_shorts'] >= behaviour['n_total'] * 0.5 and behaviour['unique_instruments'] <= 2:
+        improve.append("A large share of your trades were single-leg short positions - consider defined-risk spreads (Strategies tab) for similar views with lower margin and capped loss.")
+
+    # Deduplicate, fill to at least a minimum, cap at 3 each
+    good = list(dict.fromkeys(good))[:3]
+    improve = list(dict.fromkeys(improve))[:3]
+    if not good:
+        good = ["You completed trades and reached a session review - that's the foundation every trading habit is built on."]
+    if not improve:
+        improve = ["No major concerns stood out from this session's numbers - keep reviewing each session the same way."]
+
+    # One concept to revisit -- first matching rule wins
+    concept = "Options Greeks and how Delta/Theta/Vega jointly drive P&L as the market and time move."
+    if behaviour['naked_shorts'] > 0 and behaviour['naked_shorts'] >= behaviour['n_total'] * 0.5 and behaviour['unique_instruments'] <= 2:
+        concept = "Defined-risk spreads (verticals, butterflies) and why they need far less margin than a naked short."
+    elif analytics and analytics['avg_holding_minutes'] is not None and analytics['avg_holding_minutes'] < BAR_MINUTES * 2:
+        concept = "Time decay (Theta) - why an option's value erodes with time even if the market doesn't move."
+    elif analytics and analytics['max_drawdown'] > 0 and analytics['equity_y'][-1] > 0 and analytics['max_drawdown'] > 0.6 * max(analytics['equity_y']):
+        concept = "Risk management and exit discipline - locking in gains before they round-trip back to breakeven."
+    elif behaviour['margin_util_pct'] >= 80:
+        concept = "Margin as a risk constraint - what drives it up, and how defined-risk structures reduce it."
+
+    return good, improve, concept
+
+def compute_performance_analytics(tradebook):
+    """Trading-journal-style analytics beyond win rate, computed from CLOSED trades in
+    the tradebook. Everything here is per-trade (not annualized) since a single classroom
+    session is far too short a sample for a real annualized Sharpe ratio -- the 'Sharpe-like
+    score' is explicitly a teaching approximation (mean/std of trade P&L), not a
+    finance-grade risk-adjusted return metric."""
+    closed = [t for t in tradebook if t['status'] == 'Closed']
+    n = len(closed)
+    if n == 0:
+        return None
+
+    pnls = [t['pnl'] for t in closed]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float('inf') if gross_profit > 0 else 0.0)
+
+    avg_profit = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0.0  # negative, or 0 if no losses
+    risk_reward = (avg_profit / abs(avg_loss)) if avg_loss != 0 else (float('inf') if avg_profit > 0 else 0.0)
+
+    expectancy = sum(pnls) / n
+    mean_pnl = expectancy
+    std_pnl = (sum((p - mean_pnl) ** 2 for p in pnls) / n) ** 0.5 if n > 1 else 0.0
+    sharpe_like = (mean_pnl / std_pnl) if std_pnl > 0 else None
+
+    holding_values = [float(t.get('holding_minutes', 0.0) or 0.0) for t in closed]
+    avg_holding_minutes = (sum(holding_values) / len(holding_values)) if holding_values else None
+
+    best_trade = max(closed, key=lambda t: t['pnl'])
+    worst_trade = min(closed, key=lambda t: t['pnl'])
+
+    # Consecutive win/loss streaks, in chronological (exit-order) sequence
+    ordered = sorted(closed, key=lambda t: str(t.get('exit_dt') or t.get('exit_time') or ''))
+    max_win_streak = cur_win_streak = 0
+    max_loss_streak = cur_loss_streak = 0
+    for t in ordered:
+        if t['pnl'] > 0:
+            cur_win_streak += 1
+            cur_loss_streak = 0
+        elif t['pnl'] < 0:
+            cur_loss_streak += 1
+            cur_win_streak = 0
+        else:
+            cur_win_streak = cur_loss_streak = 0
+        max_win_streak = max(max_win_streak, cur_win_streak)
+        max_loss_streak = max(max_loss_streak, cur_loss_streak)
+
+    # Equity curve: cumulative REALIZED P&L in exit order (step 0 = before any exit)
+    equity_x = list(range(len(ordered) + 1))
+    equity_y = [0.0]
+    running = 0.0
+    for t in ordered:
+        running += t['pnl']
+        equity_y.append(running)
+
+    # Max drawdown on that realized equity curve, tracking exactly where it happened
+    peak = equity_y[0]
+    peak_idx = 0
+    max_dd = 0.0
+    dd_peak_idx = dd_trough_idx = 0
+    for i, v in enumerate(equity_y):
+        if v > peak:
+            peak = v
+            peak_idx = i
+        dd = peak - v
+        if dd > max_dd:
+            max_dd = dd
+            dd_peak_idx = peak_idx
+            dd_trough_idx = i
+
+    return {
+        'n_closed': n, 'profit_factor': profit_factor, 'avg_profit': avg_profit, 'avg_loss': avg_loss,
+        'risk_reward': risk_reward, 'expectancy': expectancy, 'sharpe_like': sharpe_like,
+        'avg_holding_minutes': avg_holding_minutes, 'best_trade': best_trade, 'worst_trade': worst_trade,
+        'max_win_streak': max_win_streak, 'max_loss_streak': max_loss_streak, 'max_drawdown': max_dd,
+        'equity_x': equity_x, 'equity_y': equity_y, 'dd_peak_idx': dd_peak_idx, 'dd_trough_idx': dd_trough_idx,
+    }
+
+
+def check_mission_progress(mission_id):
+    tb = st.session_state.get("tradebook", [])
+    closed = [t for t in tb if t.get("status") == "Closed"]
+
+    if mission_id == "learn_calls":
+        hit = [t for t in closed if t.get("type") == "CE" and t.get("side") == "Buy" and float(t.get("pnl",0)) > 0]
+        return bool(hit), f"{len(hit)} profitable long call trade(s) closed." if hit else "No profitable long call closed yet."
+
+    if mission_id == "learn_puts":
+        hit = [t for t in closed if t.get("type") == "PE" and t.get("side") == "Buy" and float(t.get("pnl",0)) > 0]
+        return bool(hit), f"{len(hit)} profitable long put trade(s) closed." if hit else "No profitable long put closed yet."
+
+    if mission_id == "time_decay":
+        spot = float(st.session_state.get("current_price", 0) or 0)
+        atm = round(spot / 100) * 100 if spot else None
+        open_trades = [t for t in tb if t.get("status") == "Open" and t.get("type") in ("CE","PE")]
+        has_atm = any(t.get("strike") == atm for t in open_trades)
+        has_non_atm = any(t.get("strike") != atm for t in open_trades)
+        return (has_atm and has_non_atm), ("Currently holding ATM + non-ATM options — compare Theta." if has_atm and has_non_atm else "Hold an ATM and another-strike option together to compare time decay.")
+
+    if mission_id == "volatility":
+        hot = any(float(t.get("iv_at_entry", 0) or 0) >= 16.0 for t in tb)
+        return hot, "Traded while ATM IV was 16%+." if hot else "No trade recorded at 16%+ IV yet."
+
+    if mission_id == "hedging":
+        has_fut = any(t.get("type") == "FUT" for t in tb)
+        return has_fut, "Executed a strategy with a synthetic underlying leg." if has_fut else "Try Protective Put/Call from the strategy builder."
+
+    if mission_id == "strategy":
+        by_group = {}
+        for t in tb:
+            gid = t.get("order_group_id") or t.get("strategy_name")
+            if gid:
+                by_group.setdefault(str(gid), []).append(t)
+        for legs in by_group.values():
+            types = [(l.get("side"), l.get("type")) for l in legs]
+            if ("Buy","CE") in types and ("Sell","CE") in types:
+                buys = [l for l in legs if l.get("side")=="Buy" and l.get("type")=="CE"]
+                sells = [l for l in legs if l.get("side")=="Sell" and l.get("type")=="CE"]
+                if buys and sells and float(sells[0].get("strike",0)) > float(buys[0].get("strike",0)):
+                    return True, "Bull Call Spread executed."
+        return False, "No Bull Call Spread executed yet."
+
+    if mission_id == "risk":
+        total_pnl = float(st.session_state.get("realized_pnl", 0.0))
+        cap = float(st.session_state.get("starting_capital", 0.0))
+        peak = float(st.session_state.get("peak_margin_used", 0.0))
+        util = peak / cap * 100 if cap > 0 else 0.0
+        done = total_pnl > 0 and util < 50
+        return done, f"Realized P&L ₹{total_pnl:+,.0f}; peak margin utilization {util:.0f}%."
+
+    return False, ""
+
+
+
+def evaluate_challenge():
+    name = st.session_state.get("active_challenge")
+    if not name or name not in CHALLENGE_CATALOGUE:
+        return None
+    cfg = CHALLENGE_CATALOGUE[name]
+    total_pnl = float(st.session_state.get("realized_pnl", 0.0))
+    analytics = compute_performance_analytics(st.session_state.get("tradebook", []))
+    max_dd = analytics["max_drawdown"] if analytics else 0.0
+    n_trades = len(st.session_state.get("tradebook", []))
+
+    if max_dd > cfg["max_drawdown"]:
+        status, reason = "lost", f"Max drawdown limit exceeded (₹{max_dd:,.0f} > ₹{cfg['max_drawdown']:,.0f})."
+    elif n_trades > cfg["max_trades"]:
+        status, reason = "lost", f"Trade limit exceeded ({n_trades} > {cfg['max_trades']})."
+    elif total_pnl >= cfg["profit_target"]:
+        status, reason = "won", f"Profit target reached (₹{total_pnl:,.0f})."
+    else:
+        status, reason = "in_progress", ""
+
+    return {"status": status, "reason": reason, "total_pnl": total_pnl,
+            "max_dd": max_dd, "n_trades": n_trades, "cfg": cfg}
+
+
 def generate_pdf_report():
     pdf = FPDF(orientation="L")
     pdf.add_page()
@@ -2242,6 +2737,49 @@ def generate_pdf_report():
             for val in row:
                 pdf.cell(col_w, 6, f"{val:+.1f}", 1)
             pdf.ln()
+
+
+    # Advanced session analytics and rule-based learning review.
+    analytics = compute_performance_analytics(st.session_state.tradebook)
+    behaviour = compute_trading_behaviour(
+        st.session_state.tradebook,
+        st.session_state.positions,
+        float(st.session_state.get("peak_margin_used", 0.0)),
+        float(st.session_state.get("starting_capital", 0.0)),
+    )
+    if analytics:
+        pdf.add_page()
+        pdf.set_font("Arial", "B", 14)
+        pdf.cell(0, 9, "Trading Analytics & Learning Review", ln=True)
+        pdf.set_font("Arial", "", 10)
+        pf = analytics["profit_factor"]
+        rr = analytics["risk_reward"]
+        pdf.cell(0, 6, f"Profit Factor: {'Infinity' if pf == float('inf') else f'{pf:.2f}'}", ln=True)
+        pdf.cell(0, 6, f"Risk/Reward: {'Infinity' if rr == float('inf') else f'{rr:.2f}'}", ln=True)
+        pdf.cell(0, 6, f"Expectancy per closed trade: Rs {analytics['expectancy']:+,.2f}", ln=True)
+        pdf.cell(0, 6, f"Average holding period: {analytics['avg_holding_minutes'] or 0:.1f} simulated minutes", ln=True)
+        pdf.cell(0, 6, f"Peak margin utilization: {behaviour['margin_util_pct']:.1f}%", ln=True)
+        pdf.cell(0, 6, f"Unique instruments traded: {behaviour['unique_instruments']}", ln=True)
+        pdf.ln(3)
+
+        good, improve, concept = generate_learning_summary(analytics, behaviour, st.session_state.positions)
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "What worked well", ln=True)
+        pdf.set_font("Arial", "", 9)
+        for line in good:
+            pdf.multi_cell(0, 5, "- " + line.replace("₹", "Rs "))
+        pdf.ln(2)
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "What to improve", ln=True)
+        pdf.set_font("Arial", "", 9)
+        for line in improve:
+            pdf.multi_cell(0, 5, "- " + line.replace("₹", "Rs "))
+        pdf.ln(2)
+        pdf.set_font("Arial", "B", 11)
+        pdf.cell(0, 7, "Concept to revisit", ln=True)
+        pdf.set_font("Arial", "", 9)
+        pdf.multi_cell(0, 5, concept)
+
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"performance_report_{timestamp}.pdf"
@@ -2400,7 +2938,7 @@ def _trade_datetime_text(t, which):
     Human-readable simulated market date/time.
 
     New trades store entry_dt/exit_dt explicitly. For older trades created before
-    Build 2.6.0, recover a missing exit date from entry_dt + holding_minutes when
+    Build 3.0.0, recover a missing exit date from entry_dt + holding_minutes when
     possible, instead of displaying only HH:MM:SS.
     """
     iso_key = "entry_dt" if which == "entry" else "exit_dt"
@@ -2632,7 +3170,7 @@ def _prepare_new_five_day_session():
     """
     preserve = {
         "participant_id", "student_name", "student_id", "student_email",
-        "starting_capital", "lot_size",
+        "starting_capital", "lot_size", "user_experience", "sim_mode", "active_challenge",
     }
     kept = {k: st.session_state.get(k) for k in preserve if k in st.session_state}
 
@@ -2887,6 +3425,50 @@ def main():
             f"to make risk limits meaningful for the exercise."
         )
 
+        st.markdown('<div class="section-title">Learning Mode & Challenge Settings</div>', unsafe_allow_html=True)
+        sm1, sm2 = st.columns(2)
+        with sm1:
+            user_experience = st.selectbox(
+                "Options experience",
+                ["Beginner", "Intermediate", "Advanced"],
+                index=["Beginner", "Intermediate", "Advanced"].index(
+                    st.session_state.get("user_experience", "Intermediate")
+                    if st.session_state.get("user_experience", "Intermediate") in ["Beginner","Intermediate","Advanced"]
+                    else "Intermediate"
+                ),
+                key="setup_user_experience",
+            )
+        with sm2:
+            sim_mode = st.selectbox(
+                "Simulation mode",
+                ["Learning Mode", "Practice Mode", "Challenge Mode"],
+                index=["Learning Mode", "Practice Mode", "Challenge Mode"].index(
+                    st.session_state.get("sim_mode", "Learning Mode")
+                    if st.session_state.get("sim_mode", "Learning Mode") in ["Learning Mode","Practice Mode","Challenge Mode"]
+                    else "Learning Mode"
+                ),
+                key="setup_sim_mode",
+            )
+
+        selected_challenge = None
+        if sim_mode == "Challenge Mode":
+            selected_challenge = st.selectbox(
+                "Challenge objective",
+                list(CHALLENGE_CATALOGUE.keys()),
+                index=0,
+                key="setup_challenge",
+            )
+            cfg = CHALLENGE_CATALOGUE[selected_challenge]
+            st.caption(
+                f"Target ₹{cfg['profit_target']:,.0f} · max drawdown ₹{cfg['max_drawdown']:,.0f} · "
+                f"max {cfg['max_trades']} trades. Your chosen starting capital is still retained; "
+                "leaderboard ranking remains based on realized return %."
+            )
+        elif sim_mode == "Learning Mode":
+            st.caption("Learning Mode keeps educational prompts, missions and explanations visible.")
+        else:
+            st.caption("Practice Mode keeps the trading mechanics but reduces instructional commentary.")
+
         strategy_focus = st.selectbox(
             "Session learning focus",
             [
@@ -2906,6 +3488,9 @@ def main():
             st.session_state.starting_capital = float(capital_input)
             st.session_state.lot_size = int(lot_size_input)
             st.session_state.strategy_focus = strategy_focus
+            st.session_state.user_experience = user_experience
+            st.session_state.sim_mode = sim_mode
+            st.session_state.active_challenge = selected_challenge if sim_mode == "Challenge Mode" else None
             st.session_state.equity_peak = float(capital_input)
             st.session_state.max_drawdown = 0.0
             st.session_state.max_drawdown_pct = 0.0
@@ -3086,6 +3671,30 @@ def main():
     # Learning analytics: update trade MAE/max-profit and portfolio drawdown every visible bar.
     update_live_risk_metrics(current_price, current_dt, chain_df)
     update_session_drawdown(open_pnl)
+
+    # ===== PERSISTENT COCKPIT BAR =====
+    _cockpit_price_color = "#5ee0a0" if is_up else "#ff8b80"
+    _cockpit_pnl = open_pnl + realized_pnl
+    _cockpit_pnl_color = "#5ee0a0" if _cockpit_pnl >= 0 else "#ff8b80"
+    _mode_label = st.session_state.get("sim_mode") or "Learning Mode"
+    st.markdown(f"""
+    <div class="cockpit-bar">
+        <div class="cockpit-item"><span class="cockpit-label">NIFTY 50</span>
+            <span class="cockpit-val" style="color:{_cockpit_price_color};">₹{current_price:,.2f} · {price_pct:+.2f}%</span></div>
+        <div class="cockpit-sep"></div>
+        <div class="cockpit-item"><span class="cockpit-label">Session</span>
+            <span class="cockpit-val">Day {current_day_num}/{SIM_DAYS} · {current_dt.strftime('%H:%M:%S')}</span></div>
+        <div class="cockpit-sep"></div>
+        <div class="cockpit-item"><span class="cockpit-label">Mode</span><span class="cockpit-val">{_mode_label}</span></div>
+        <div class="cockpit-sep"></div>
+        <div class="cockpit-item"><span class="cockpit-label">Capital</span><span class="cockpit-val">₹{st.session_state.starting_capital:,.0f}</span></div>
+        <div class="cockpit-sep"></div>
+        <div class="cockpit-item"><span class="cockpit-label">Margin Used</span><span class="cockpit-val">₹{used_margin:,.0f}</span></div>
+        <div class="cockpit-sep"></div>
+        <div class="cockpit-item"><span class="cockpit-label">Total P&L</span>
+            <span class="cockpit-val" style="color:{_cockpit_pnl_color};">₹{_cockpit_pnl:+,.0f}</span></div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # ===== LAYOUT: LEFT + RIGHT =====
     col_left, col_right = st.columns([1, 2], gap="medium")
@@ -3270,8 +3879,8 @@ def main():
 
     # ==================== RIGHT PANEL ====================
     with col_right:
-        tab_place, tab_pos, tab_graph, tab_perf, tab_leaderboard = st.tabs([
-            "Place Order", "Positions", "Market Chart", "Performance & Progress", "Leaderboard"
+        tab_place, tab_pos, tab_graph, tab_perf, tab_learning, tab_leaderboard = st.tabs([
+            "Place Order", "Positions", "Market Chart", "Performance & Progress", "Learning & Risk", "Leaderboard"
         ])
 
         # ---------- TAB 1: PLACE ORDER ----------
@@ -3324,6 +3933,11 @@ def main():
                     st.caption("⚠️ Your limit is below the current LTP — a sell limit below LTP will fill immediately, like a market order.")
                 else:
                     st.caption("This limit will wait in the order book until the price reaches it (see 'Order Book' below).")
+
+            if hints_enabled():
+                prompt = EDUCATIONAL_PROMPTS.get((side, otype))
+                if prompt:
+                    st.markdown(f"<div class='insight-box'>{prompt}</div>", unsafe_allow_html=True)
 
             # ----- Order preview: premium, breakeven, margin -- before the student commits -----
             _preview_px = limit_price if (order_type == "LIMIT" and limit_price is not None) else ltp
@@ -3541,6 +4155,55 @@ def main():
 
             st.markdown('</div>', unsafe_allow_html=True)  # close order-card
 
+            # ----- STRATEGY LAB: market-view + IV recommender -----
+            with st.expander("Strategy Lab — match market view and volatility", expanded=False):
+                sl1, sl2 = st.columns(2)
+                with sl1:
+                    view_choice = st.radio(
+                        "Market view", ["Bullish", "Bearish", "Neutral", "Volatile"],
+                        horizontal=True, key="lab_market_view"
+                    )
+                    st.caption(MARKET_VIEW_BLURBS[view_choice])
+                with sl2:
+                    iv_choice = st.radio(
+                        "Volatility view", ["High IV", "Low IV"],
+                        horizontal=True, key="lab_iv_view"
+                    )
+
+                candidates = []
+                for cat, strategies in STRATEGY_CATALOGUE.items():
+                    for name, legs_def in strategies.items():
+                        if view_choice not in STRATEGY_VIEW_TAGS.get(name, []):
+                            continue
+                        uses_wing_lab = any(k in ("OTM_CALL","OTM_PUT","LOWER","UPPER") for _,_,k,_ in legs_def)
+                        lab_items = build_strategy_legs(
+                            legs_def, atm_strike, 200 if uses_wing_lab else 100,
+                            1, lot_size, current_price, T_current
+                        )
+                        pref = get_strategy_iv_preference(lab_items)
+                        if pref in (iv_choice, "Either"):
+                            candidates.append((cat, name, lab_items, pref))
+
+                if not candidates:
+                    st.caption("No exact two-factor match right now. Try the other IV view or use the full builder below.")
+                else:
+                    for idx, (cat, name, items, pref) in enumerate(candidates[:4]):
+                        stats = analyze_payoff(items)
+                        req_margin = calculate_realistic_margin(items, current_price, lot_size)
+                        pop = estimate_probability_of_profit(items, current_price, T_current)
+                        c1, c2 = st.columns([4,1])
+                        with c1:
+                            st.markdown(
+                                f"**{name.split('(')[0].strip()}** · {pref} · "
+                                f"Margin ₹{req_margin:,.0f} · Model PoP {pop*100:.0f}%"
+                            )
+                        with c2:
+                            if st.button("Load", key=f"lab_load_{idx}", use_container_width=True):
+                                st.session_state["strat_cat"] = cat
+                                st.session_state["strat_name"] = name
+                                st.rerun()
+                    st.caption("Probability of Profit is a model/risk-neutral teaching estimate, not a forecast.")
+
             # ----- STRATEGY BUILDER: pick a ready-made multi-leg strategy -----
             st.markdown('<div class="strategy-card">', unsafe_allow_html=True)
             st.markdown('<div class="order-card-title">Or build a ready-made strategy</div>', unsafe_allow_html=True)
@@ -3612,6 +4275,10 @@ def main():
             with st.expander("View payoff diagram for this strategy"):
                 fig_strat, _ = render_payoff_diagram(strat_items, current_price, title=f"{strat_name.split('(')[0].strip()} — Payoff at Expiry")
                 st.plotly_chart(fig_strat, use_container_width=True, config={'displayModeBar': False})
+                render_payoff_slider(strat_items, current_price, key_prefix="builder")
+                scenario_df = compute_scenario_pnl(strat_items, current_price, T_current)
+                st.caption("Current-time scenario P&L if NIFTY moved immediately, using the same pricing model and time-to-expiry.")
+                st.dataframe(scenario_df, use_container_width=True, hide_index=True)
             if uses_fut:
                 st.markdown(f"<div class='strategy-note'>⚠️ {STRATEGY_FUT_NOTE}</div>", unsafe_allow_html=True)
             st.markdown(
@@ -3832,6 +4499,27 @@ def main():
 
         # ---------- TAB 2: POSITIONS ----------
         with tab_pos:
+            _util_pct = (used_margin / st.session_state.starting_capital * 100.0) if st.session_state.starting_capital > 0 else 0.0
+            if _util_pct >= 90:
+                _risk_label, _risk_cls, _bar_color = "CRITICAL", "risk-critical", "#a3160c"
+            elif _util_pct >= 75:
+                _risk_label, _risk_cls, _bar_color = "HIGH", "risk-high", "#e74c3c"
+            elif _util_pct >= 50:
+                _risk_label, _risk_cls, _bar_color = "MODERATE", "risk-moderate", "#e6a800"
+            else:
+                _risk_label, _risk_cls, _bar_color = "LOW", "risk-low", "#00a86b"
+
+            st.markdown('<div class="section-title">Risk Dashboard</div>', unsafe_allow_html=True)
+            rd1, rd2, rd3 = st.columns(3)
+            rd1.metric("Margin Used", f"₹{used_margin:,.0f}")
+            rd2.metric("Available Margin", f"₹{available_margin:,.0f}")
+            rd3.markdown(f'<span class="risk-badge {_risk_cls}">{_risk_label}</span>', unsafe_allow_html=True)
+            st.markdown(f"""
+            <div class="risk-util-track"><div class="risk-util-fill"
+                style="width:{min(_util_pct,100):.1f}%;background:{_bar_color};"></div></div>
+            """, unsafe_allow_html=True)
+            st.caption(f"Margin utilization: {_util_pct:.1f}% of starting capital. Thresholds are teaching guides, not exchange SPAN rules.")
+
             st.markdown('<div class="section-title">Open Trades</div>', unsafe_allow_html=True)
             st.caption(
                 "Each executed BUY or SELL remains visible as its own open trade. "
@@ -3997,6 +4685,19 @@ def main():
             peak_m = max(st.session_state.peak_margin_used, 1)
             capital_eff = total_now / peak_m * 100.0
             p4.metric("Return on Margin", f"{capital_eff:+.2f}%")
+
+            _analytics = compute_performance_analytics(st.session_state.tradebook)
+            if _analytics is not None:
+                st.markdown('<div class="section-title">Trading Analytics</div>', unsafe_allow_html=True)
+                pf_txt = "∞" if _analytics["profit_factor"] == float("inf") else f"{_analytics['profit_factor']:.2f}"
+                rr_txt = "∞" if _analytics["risk_reward"] == float("inf") else f"{_analytics['risk_reward']:.2f}"
+                a1, a2, a3, a4 = st.columns(4)
+                a1.metric("Profit Factor", pf_txt)
+                a2.metric("Risk / Reward", rr_txt)
+                a3.metric("Expectancy / Trade", f"₹{_analytics['expectancy']:+,.0f}")
+                a4.metric("Avg Holding", f"{(_analytics['avg_holding_minutes'] or 0):.0f} min")
+                st.plotly_chart(render_equity_curve(_analytics), use_container_width=True, config={"displayModeBar": False})
+                st.caption("Analytics are per-trade/session measures; no annualized return or annualized Sharpe is used.")
 
             st.markdown('<div class="section-title">Executed Trades</div>', unsafe_allow_html=True)
             if st.session_state.tradebook:
@@ -4199,7 +4900,85 @@ def main():
                             key="download_final_session_pdf_tab",
                         )
 
-        # ---------- TAB 5: LEADERBOARD ----------
+        # ---------- TAB 5: LEARNING & RISK ----------
+        with tab_learning:
+            if st.session_state.get("sim_mode") == "Challenge Mode" and st.session_state.get("active_challenge"):
+                challenge = evaluate_challenge()
+                if challenge:
+                    cls = {"won":"risk-low", "lost":"risk-critical", "in_progress":"risk-moderate"}[challenge["status"]]
+                    label = {"won":"CHALLENGE WON", "lost":"CHALLENGE FAILED", "in_progress":"IN PROGRESS"}[challenge["status"]]
+                    st.markdown('<div class="section-title">Active Challenge</div>', unsafe_allow_html=True)
+                    st.markdown(
+                        f"<span class='risk-badge {cls}'>{label}</span> &nbsp; "
+                        f"Realized P&L ₹{challenge['total_pnl']:+,.0f} · "
+                        f"Max DD ₹{challenge['max_dd']:,.0f} · Trades {challenge['n_trades']}",
+                        unsafe_allow_html=True,
+                    )
+                    if challenge["reason"]:
+                        st.caption(challenge["reason"])
+
+            st.markdown('<div class="section-title">Trading Missions</div>', unsafe_allow_html=True)
+            mission_cols = st.columns(2)
+            for i, mission in enumerate(MISSION_CATALOGUE):
+                done, note = check_mission_progress(mission["id"])
+                with mission_cols[i % 2]:
+                    st.markdown(
+                        f"<div class='item-card' style='flex-direction:column;align-items:stretch;"
+                        f"background:{'#eef6f0' if done else '#ffffff'};'>"
+                        f"<b>{'✅' if done else mission['icon']} {mission['title']}</b>"
+                        f"<span class='item-sub' style='white-space:normal;'>{mission['objective']}</span>"
+                        f"<span class='item-sub' style='white-space:normal;font-style:italic;'>{note}</span></div>",
+                        unsafe_allow_html=True,
+                    )
+
+            analytics = compute_performance_analytics(st.session_state.tradebook)
+            behaviour = compute_trading_behaviour(
+                st.session_state.tradebook,
+                st.session_state.positions,
+                st.session_state.peak_margin_used,
+                st.session_state.starting_capital,
+            )
+            st.markdown('<div class="section-title">Session Learning Review</div>', unsafe_allow_html=True)
+            if analytics:
+                good, improve, concept = generate_learning_summary(analytics, behaviour, st.session_state.positions)
+                l1, l2 = st.columns(2)
+                with l1:
+                    st.markdown("**What worked well**")
+                    for line in good:
+                        st.success(line)
+                with l2:
+                    st.markdown("**What to improve**")
+                    for line in improve:
+                        st.warning(line)
+                st.info(f"Concept to revisit: {concept}")
+                st.caption("Deterministic rule-based feedback from the student's own session metrics; not AI-generated and not a grade.")
+            else:
+                st.caption("Close at least one trade to populate the learning review.")
+
+            st.markdown('<div class="section-title">Model & Glossary</div>', unsafe_allow_html=True)
+            with st.expander("How the simulator works"):
+                st.markdown("""
+- **Market path:** 5-day, 5-minute-bar NIFTY-like simulation using a GARCH(1,1) volatility process.
+- **Option pricing:** Black–Scholes–Merton using current spot, strike, time to expiry and a simplified IV surface.
+- **Margin:** educational broker-style approximation; not NSE SPAN/exchange margin.
+- **Leaderboard:** best single-session **realized return %**; independent 5-day sessions are never added together.
+- **Persistence:** Student ID links to the same Supabase profile and unfinished session.
+                """)
+            with st.expander("Options glossary"):
+                for term, definition in GLOSSARY.items():
+                    st.markdown(f"**{term.title()}** — {definition}")
+
+            if supabase_enabled():
+                st.markdown('<div class="section-title">My Supabase Session History</div>', unsafe_allow_html=True)
+                hist = get_student_history(st.session_state.get("participant_id"))
+                if hist:
+                    hdf = pd.DataFrame(hist)
+                    cols = [c for c in ["session_no","status","starting_capital","total_pnl","return_pct","total_trades","win_rate_pct","max_drawdown_pct"] if c in hdf.columns]
+                    st.dataframe(hdf[cols], use_container_width=True, hide_index=True)
+                else:
+                    st.caption("No stored session history yet.")
+
+        # ---------- TAB 6: LEADERBOARD ----------
         with tab_leaderboard:
             st.markdown(
                 '<div class="section-title">Top 5 — Best Single-Session Realized Return</div>',
