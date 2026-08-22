@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v3.0.3"
+APP_VERSION = "v3.0.4"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -2817,6 +2817,7 @@ def generate_pdf_report():
         pdf.set_font("Arial", "B", 12)
         pdf.cell(0, 8, f"Hypothetical P&L if Held {HOLD_DAYS} Days (vs Actual Exit)", ln=True)
         pdf.set_font("Arial", "", 8)
+        pdf.set_x(pdf.l_margin)
         pdf.multi_cell(0, 5, "Columns: " + " | ".join(labels))
         pdf.ln(1)
         n_cols = len(labels)
@@ -2862,18 +2863,24 @@ def generate_pdf_report():
         pdf.cell(0, 7, "What worked well", ln=True)
         pdf.set_font("Arial", "", 9)
         for line in good:
+            # fpdf2 may leave the cursor at the right edge after multi_cell().
+            # Reset to the left margin before each wrapped line so width=0
+            # always means "use the remaining printable page width".
+            pdf.set_x(pdf.l_margin)
             pdf.multi_cell(0, 5, "- " + line.replace("₹", "Rs "))
         pdf.ln(2)
         pdf.set_font("Arial", "B", 11)
         pdf.cell(0, 7, "What to improve", ln=True)
         pdf.set_font("Arial", "", 9)
         for line in improve:
+            pdf.set_x(pdf.l_margin)
             pdf.multi_cell(0, 5, "- " + line.replace("₹", "Rs "))
         pdf.ln(2)
         pdf.set_font("Arial", "B", 11)
         pdf.cell(0, 7, "Concept to revisit", ln=True)
         pdf.set_font("Arial", "", 9)
-        pdf.multi_cell(0, 5, concept)
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 5, concept.replace("₹", "Rs "))
 
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
