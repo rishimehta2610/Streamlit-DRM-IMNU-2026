@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v3.0.2"
+APP_VERSION = "v3.0.3"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -573,8 +573,15 @@ def get_cloud_report_for_session(session_id=None, participant_id=None):
 def get_report_download_payload():
     """
     Return (bytes, filename, source) for the current session report.
-    Prefer the local file; if the Streamlit instance has restarted or lost its
-    ephemeral disk, transparently fall back to the private cloud-stored copy.
+
+    Recovery order:
+    1) existing local file;
+    2) saved cloud copy;
+    3) regenerate the PDF directly from the current session state.
+
+    The third step is important on Streamlit Community Cloud because local files
+    are ephemeral and a previous cloud upload can occasionally be unavailable.
+    The user still gets a normal in-app download button.
     """
     report_path = st.session_state.get("report_path")
     if report_path and os.path.exists(report_path):
@@ -587,6 +594,30 @@ def get_report_download_payload():
     cloud_bytes, cloud_name = get_cloud_report_for_session()
     if cloud_bytes:
         return cloud_bytes, cloud_name, "cloud"
+
+    # Self-healing fallback: the completed session is still present in
+    # Streamlit session_state, so rebuild the PDF on demand instead of leaving
+    # the student without a report.
+    try:
+        if st.session_state.get("tradebook") is not None:
+            regenerated_path, regenerated_name = generate_pdf_report()
+            st.session_state.report_path = regenerated_path
+            st.session_state.report_filename = regenerated_name
+            st.session_state.report_generated = True
+
+            with open(regenerated_path, "rb") as f:
+                regenerated_bytes = f.read()
+
+            # Best-effort cloud backup. Download must NOT depend on this succeeding.
+            if supabase_enabled():
+                try:
+                    upload_report_record(regenerated_path, regenerated_name)
+                except Exception as exc:
+                    print(f"[Supabase] Regenerated report backup failed: {exc}")
+
+            return regenerated_bytes, regenerated_name, "regenerated"
+    except Exception as exc:
+        print(f"[Report] On-demand PDF regeneration failed: {exc}")
 
     return None, None, None
 
@@ -3284,8 +3315,7 @@ def _render_session_complete_panel():
             </div>
             <div style="margin-top:8px;color:#8a5a00;">
                 <b>Download this session's PDF report before starting the next simulation.</b>
-                The current on-screen/local report may no longer be available after a new
-                session starts or the app is redeployed.
+                The report can be downloaded directly from this app.
             </div>
         </div>
         """,
@@ -4948,9 +4978,8 @@ def main():
                 st.success(
                     "The five-day session is complete. The final PDF has been frozen for this independent run."
                 )
-                st.warning(
-                    "Download the final PDF before starting the next session. "
-                    "The current local report may no longer be available after a new run or app redeployment."
+                st.info(
+                    "Your final session report is ready below. Download it before starting the next session."
                 )
                 report_bytes, report_name, report_source = get_report_download_payload()
                 if report_bytes:
