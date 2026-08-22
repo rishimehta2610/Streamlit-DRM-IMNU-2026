@@ -30,7 +30,7 @@ st.set_page_config(
 # ==========================================================
 # SUPABASE PERSISTENCE LAYER — ANALYTICS + RESUME (v2)
 # ==========================================================
-APP_VERSION = "v3.0"
+APP_VERSION = "v3.0.2"
 APP_BUILD = "2026-08-19-v2.0.4"
 SUPABASE_REPORT_BUCKET = "session-reports"
 
@@ -525,6 +525,70 @@ def upload_report_record(filepath, filename):
     }
     supabase.table("session_reports").insert(payload).execute()
     return storage_path
+
+
+
+def get_cloud_report_for_session(session_id=None, participant_id=None):
+    """
+    Retrieve the most recent PDF for the current session from the private
+    Supabase Storage bucket.
+    """
+    sid = session_id or st.session_state.get("supabase_session_id")
+    pid = participant_id or st.session_state.get("participant_id")
+    if not supabase_enabled() or not sid or not pid:
+        return None, None
+
+    try:
+        resp = (
+            supabase.table("session_reports")
+            .select("*")
+            .eq("session_id", sid)
+            .eq("participant_id", pid)
+            .execute()
+        )
+        rows = _sb_data(resp)
+        if not rows:
+            return None, None
+
+        rows = sorted(
+            rows,
+            key=lambda r: str(r.get("created_at") or r.get("id") or ""),
+        )
+        report = rows[-1]
+        storage_path = report.get("storage_path")
+        filename = report.get("file_name") or "session_report.pdf"
+        if not storage_path:
+            return None, None
+
+        data = supabase.storage.from_(SUPABASE_REPORT_BUCKET).download(storage_path)
+        if not data:
+            return None, None
+        return data, filename
+
+    except Exception as exc:
+        print(f"[Supabase] Cloud report download failed: {exc}")
+        return None, None
+
+
+def get_report_download_payload():
+    """
+    Return (bytes, filename, source) for the current session report.
+    Prefer the local file; if the Streamlit instance has restarted or lost its
+    ephemeral disk, transparently fall back to the private cloud-stored copy.
+    """
+    report_path = st.session_state.get("report_path")
+    if report_path and os.path.exists(report_path):
+        try:
+            with open(report_path, "rb") as f:
+                return f.read(), os.path.basename(report_path), "local"
+        except Exception as exc:
+            print(f"[Report] Local PDF read failed: {exc}")
+
+    cloud_bytes, cloud_name = get_cloud_report_for_session()
+    if cloud_bytes:
+        return cloud_bytes, cloud_name, "cloud"
+
+    return None, None, None
 
 
 def _progress_state_payload():
@@ -3228,21 +3292,20 @@ def _render_session_complete_panel():
         unsafe_allow_html=True,
     )
 
-    report_path = st.session_state.get("report_path")
-    if report_path and os.path.exists(report_path):
-        with open(report_path, "rb") as f:
-            st.download_button(
-                "Download Current Session PDF",
-                f,
-                file_name=os.path.basename(report_path),
-                mime="application/pdf",
-                use_container_width=True,
-                key="download_completed_session_pdf",
-            )
+    report_bytes, report_name, report_source = get_report_download_payload()
+    if report_bytes:
+        st.download_button(
+            "Download Final Session PDF",
+            data=report_bytes,
+            file_name=report_name,
+            mime="application/pdf",
+            use_container_width=True,
+            key="download_completed_session_pdf",
+        )
     else:
-        st.warning(
-            "The local PDF copy is not available on this app instance. "
-            "If a cloud backup was successfully created, the session record remains stored."
+        st.error(
+            "The final PDF report is temporarily unavailable for this session. "
+            "Please try again or contact the administrator."
         )
 
     if st.button(
@@ -4889,16 +4952,21 @@ def main():
                     "Download the final PDF before starting the next session. "
                     "The current local report may no longer be available after a new run or app redeployment."
                 )
-                if st.session_state.get("report_path") and os.path.exists(st.session_state.report_path):
-                    with open(st.session_state.report_path, "rb") as f:
-                        st.download_button(
-                            "Download Final Session PDF",
-                            f,
-                            file_name=os.path.basename(st.session_state.report_path),
-                            mime="application/pdf",
-                            use_container_width=True,
-                            key="download_final_session_pdf_tab",
-                        )
+                report_bytes, report_name, report_source = get_report_download_payload()
+                if report_bytes:
+                    st.download_button(
+                        "Download Final Session PDF",
+                        data=report_bytes,
+                        file_name=report_name,
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="download_final_session_pdf_tab",
+                    )
+                else:
+                    st.error(
+                        "The final PDF report is temporarily unavailable for this session. "
+                        "Please try again or contact the administrator."
+                    )
 
         # ---------- TAB 5: LEARNING & RISK ----------
         with tab_learning:
